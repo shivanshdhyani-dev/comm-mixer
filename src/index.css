@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-surface text-zinc-200 antialiased;
+  background-image: linear-gradient(180deg, #060606 0%, #030303 55%, #020202 100%);
+  background-attachment: fixed;
+  margin: 0;
+}
+
+/* Glass panel */
+.glass {
+  background: linear-gradient(
+    145deg,
+    rgba(18, 18, 18, 0.82) 0%,
+    rgba(10, 10, 10, 0.9) 100%
+  );
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
