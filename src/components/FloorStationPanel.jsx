@@ -19,12 +19,15 @@ export default function FloorStationPanel({
   const [sinkSales, setSinkSales] = useState("");
   const [status, setStatus] = useState("");
   const [linking, setLinking] = useState(false);
+  const [inputLevels, setInputLevels] = useState({ customer: 0, sales: 0 });
 
   const pcRef = useRef(null);
   const customerStreamRef = useRef(null);
   const salesStreamRef = useRef(null);
   const mixedOutStreamRef = useRef(null);
   const captureMixCtxRef = useRef(null);
+  const meterRafRef = useRef(null);
+  const meterCtxRef = useRef(null);
   const supervisorStreamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const gainCustomerRef = useRef(null);
@@ -79,8 +82,54 @@ export default function FloorStationPanel({
       captureMixCtxRef.current.close();
       captureMixCtxRef.current = null;
     }
+    if (meterRafRef.current) {
+      cancelAnimationFrame(meterRafRef.current);
+      meterRafRef.current = null;
+    }
+    if (meterCtxRef.current) {
+      meterCtxRef.current.close();
+      meterCtxRef.current = null;
+    }
+    setInputLevels({ customer: 0, sales: 0 });
     teardownPlaybackOnly();
   }, [teardownPlaybackOnly]);
+
+  const startMeters = useCallback((cStream, sStream) => {
+    if (meterRafRef.current) cancelAnimationFrame(meterRafRef.current);
+    if (meterCtxRef.current) meterCtxRef.current.close();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    meterCtxRef.current = ctx;
+    void ctx.resume().catch(() => {});
+    const cSrc = ctx.createMediaStreamSource(cStream);
+    const sSrc = ctx.createMediaStreamSource(sStream);
+    const cAn = ctx.createAnalyser();
+    const sAn = ctx.createAnalyser();
+    cAn.fftSize = 256;
+    sAn.fftSize = 256;
+    cSrc.connect(cAn);
+    sSrc.connect(sAn);
+    const cData = new Uint8Array(cAn.fftSize);
+    const sData = new Uint8Array(sAn.fftSize);
+
+    const tick = () => {
+      cAn.getByteTimeDomainData(cData);
+      sAn.getByteTimeDomainData(sData);
+      const rms = (arr) => {
+        let sum = 0;
+        for (let i = 0; i < arr.length; i += 1) {
+          const v = (arr[i] - 128) / 128;
+          sum += v * v;
+        }
+        return Math.sqrt(sum / arr.length);
+      };
+      const cLevel = Math.min(100, Math.round(rms(cData) * 240));
+      const sLevel = Math.min(100, Math.round(rms(sData) * 240));
+      setInputLevels({ customer: cLevel, sales: sLevel });
+      meterRafRef.current = requestAnimationFrame(tick);
+    };
+    meterRafRef.current = requestAnimationFrame(tick);
+  }, []);
 
   const buildTalkbackGraph = useCallback(
     (supervisorStream) => {
@@ -233,6 +282,7 @@ export default function FloorStationPanel({
       }
       customerStreamRef.current = cStream;
       salesStreamRef.current = sStream;
+      startMeters(cStream, sStream);
       applyMicMutes();
 
       const pc = new RTCPeerConnection({
@@ -276,6 +326,16 @@ export default function FloorStationPanel({
         targetSocketId: supervisor.socketId,
         sdp: offer,
       });
+      setTimeout(() => {
+        setInputLevels((levels) => {
+          if (levels.customer < 4 || levels.sales < 4) {
+            setStatus(
+              "One selected mic looks inactive. Check mic selection and speak closer to each mic."
+            );
+          }
+          return levels;
+        });
+      }, 1600);
       setStatus("Offer sent — waiting for supervisor…");
     } catch (e) {
       setStatus("Could not access mics or start link.");
@@ -368,6 +428,26 @@ export default function FloorStationPanel({
         {!supervisor && (
           <span className="text-xs text-amber-300">Waiting for supervisor to sign in…</span>
         )}
+      </div>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <div>
+          <p className="mb-1 text-xs text-zinc-500">Customer mic level</p>
+          <div className="h-2 w-full overflow-hidden rounded bg-white/10">
+            <div
+              className="h-full bg-accent-teal transition-all"
+              style={{ width: `${inputLevels.customer}%` }}
+            />
+          </div>
+        </div>
+        <div>
+          <p className="mb-1 text-xs text-zinc-500">Sales mic level</p>
+          <div className="h-2 w-full overflow-hidden rounded bg-white/10">
+            <div
+              className="h-full bg-accent-teal transition-all"
+              style={{ width: `${inputLevels.sales}%` }}
+            />
+          </div>
+        </div>
       </div>
       {status && <p className="mt-3 text-sm text-zinc-400">{status}</p>}
 
