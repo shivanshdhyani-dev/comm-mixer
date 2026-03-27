@@ -208,19 +208,29 @@ export default function FloorStationPanel({
       const cStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: { exact: micCustomer },
-          echoCancellation: true,
-          noiseSuppression: true,
+          // Disable voice-processing to reduce single-mic takeover behavior.
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
         },
         video: false,
       });
       const sStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           deviceId: { exact: micSales },
-          echoCancellation: true,
-          noiseSuppression: true,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
         },
         video: false,
       });
+      const cTrack = cStream.getAudioTracks()[0];
+      const sTrack = sStream.getAudioTracks()[0];
+      if (!cTrack || !sTrack) {
+        throw new Error("One or both selected microphones are unavailable.");
+      }
       customerStreamRef.current = cStream;
       salesStreamRef.current = sStream;
       applyMicMutes();
