@@ -338,7 +338,11 @@ export default function FloorStationPanel({
       }, 1600);
       setStatus("Offer sent — waiting for supervisor…");
     } catch (e) {
-      setStatus("Could not access mics or start link.");
+      setStatus(
+        e?.message
+          ? `Could not start link: ${e.message}`
+          : "Could not access mics or start link."
+      );
       teardown();
     } finally {
       setLinking(false);
