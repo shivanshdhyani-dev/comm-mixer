@@ -8,6 +8,7 @@ import AuthPanel from "./components/AuthPanel";
 import FloorStationPanel from "./components/FloorStationPanel";
 import { createMixerSocket } from "./services/socket";
 import useLocalMixer from "./hooks/useLocalMixer";
+import { getIceServers } from "./webrtcConfig";
 
 const initialState = {
   mode: "listen",
@@ -40,7 +41,7 @@ const initialState = {
       name: "Ankit Verma",
       role: "Supervisor",
       initial: "SV",
-      micOn: false,
+      micOn: true,
       monitoring: true,
     },
   ],
@@ -111,7 +112,7 @@ export default function App() {
       if (existing) existing.close();
 
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        iceServers: getIceServers(),
       });
       peerConnectionsRef.current.set(fromSocketId, pc);
 
@@ -127,8 +128,12 @@ export default function App() {
         const [stream] = event.streams;
         if (!stream) return;
         const idx = floorInboundOrderRef.current++;
-        const key = idx === 0 ? "customer" : "sales";
-        setFloorInbound((prev) => ({ ...prev, [key]: stream }));
+        if (idx === 0) {
+          // Floor may send a single mixed stream (customer + sales combined).
+          setFloorInbound({ customer: stream, sales: stream });
+          return;
+        }
+        setFloorInbound((prev) => ({ ...prev, sales: stream }));
       };
 
       await pc.setRemoteDescription(sdp);
@@ -144,6 +149,7 @@ export default function App() {
           });
           localStreamRef.current = stream;
           setMediaError("");
+          socket.emit("media:micState", { micOn: true });
         } catch {
           setMediaError("Supervisor microphone unavailable.");
           return;
@@ -220,6 +226,12 @@ export default function App() {
 
   async function startLocalAudio() {
     try {
+      if (localStreamRef.current) {
+        if (authRef.current?.role === "supervisor") {
+          socket.emit("media:micState", { micOn: true });
+        }
+        return;
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -263,15 +275,27 @@ export default function App() {
     if (auth?.role !== "supervisor") return;
     const c = audioFloorCustomerRef.current;
     const s = audioFloorSalesRef.current;
+    const tryPlay = (el) => {
+      if (!el) return;
+      el.play().catch(() => {
+        const once = () => {
+          el.play().catch(() => {});
+          document.removeEventListener("click", once);
+          document.removeEventListener("keydown", once);
+        };
+        document.addEventListener("click", once);
+        document.addEventListener("keydown", once);
+      });
+    };
     if (c && floorInbound.customer) {
       c.srcObject = floorInbound.customer;
       c.volume = vol;
-      c.play().catch(() => {});
+      tryPlay(c);
     }
     if (s && floorInbound.sales) {
       s.srcObject = floorInbound.sales;
       s.volume = vol;
-      s.play().catch(() => {});
+      tryPlay(s);
     }
   }, [auth?.role, floorInbound.customer, floorInbound.sales, vol]);
 

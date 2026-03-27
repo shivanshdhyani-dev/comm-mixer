@@ -1,6 +1,9 @@
 import { io } from "socket.io-client";
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:4000"|| "https://comm-mixer.onrender.com/";
+/** Prefer VITE_BACKEND_URL. Dev → localhost; production build without env → deploy backend (not user localhost). */
+const BACKEND_URL =
+  import.meta.env.VITE_BACKEND_URL ||
+  (import.meta.env.DEV ? "http://localhost:4000" : "https://comm-mixer.onrender.com");
 
 export function createMixerSocket() {
   return io(BACKEND_URL, {

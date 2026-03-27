@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getIceServers } from "../webrtcConfig";
 
 /**
  * Store laptop: two headset mics (customer + sales) → supervisor;
@@ -22,6 +23,8 @@ export default function FloorStationPanel({
   const pcRef = useRef(null);
   const customerStreamRef = useRef(null);
   const salesStreamRef = useRef(null);
+  const mixedOutStreamRef = useRef(null);
+  const captureMixCtxRef = useRef(null);
   const supervisorStreamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const gainCustomerRef = useRef(null);
@@ -71,6 +74,11 @@ export default function FloorStationPanel({
     salesStreamRef.current?.getTracks?.().forEach((t) => t.stop());
     customerStreamRef.current = null;
     salesStreamRef.current = null;
+    mixedOutStreamRef.current = null;
+    if (captureMixCtxRef.current) {
+      captureMixCtxRef.current.close();
+      captureMixCtxRef.current = null;
+    }
     teardownPlaybackOnly();
   }, [teardownPlaybackOnly]);
 
@@ -81,6 +89,7 @@ export default function FloorStationPanel({
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const ctx = new AudioCtx();
       audioCtxRef.current = ctx;
+      void ctx.resume().catch(() => {});
       const src = ctx.createMediaStreamSource(supervisorStream);
       const gC = ctx.createGain();
       const gS = ctx.createGain();
@@ -217,7 +226,7 @@ export default function FloorStationPanel({
       applyMicMutes();
 
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        iceServers: getIceServers(),
       });
       pcRef.current = pc;
 
@@ -236,8 +245,20 @@ export default function FloorStationPanel({
         }
       };
 
-      pc.addTrack(cStream.getAudioTracks()[0], cStream);
-      pc.addTrack(sStream.getAudioTracks()[0], sStream);
+      // Mix both headset mics into one outgoing channel to avoid multi-track
+      // device capture inconsistencies on single-laptop store setups.
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const mixCtx = new AudioCtx();
+      captureMixCtxRef.current = mixCtx;
+      void mixCtx.resume().catch(() => {});
+      const dest = mixCtx.createMediaStreamDestination();
+      const cSrc = mixCtx.createMediaStreamSource(cStream);
+      const sSrc = mixCtx.createMediaStreamSource(sStream);
+      cSrc.connect(dest);
+      sSrc.connect(dest);
+      mixedOutStreamRef.current = dest.stream;
+      const mixedTrack = dest.stream.getAudioTracks()[0];
+      if (mixedTrack) pc.addTrack(mixedTrack, dest.stream);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);

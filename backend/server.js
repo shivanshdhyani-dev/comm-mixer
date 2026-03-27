@@ -46,7 +46,7 @@ const createInitialState = () => ({
       name: "Ankit Verma",
       role: "Supervisor",
       initial: "SV",
-      micOn: false,
+      micOn: true,
       monitoring: true,
     },
   ],
