@@ -1,12 +1,12 @@
 import { useState } from "react";
 
 const roles = [
-    { id: "sales", label: "Sales Executive" },
-  { id: "supervisor", label: "Supervisor" },
+  { id: "floor", label: "Store desk (Meet laptop — 2 headsets)" },
+  { id: "supervisor", label: "Supervisor (separate laptop)" },
 ];
 
 export default function AuthPanel({ onLogin, error, loading, backendConnected }) {
-  const [role, setRole] = useState("sales");
+  const [role, setRole] = useState("floor");
   const [name, setName] = useState("");
   const [pin, setPin] = useState("");
 
@@ -73,7 +73,7 @@ export default function AuthPanel({ onLogin, error, loading, backendConnected })
         </button>
 
         <p className="mt-3 text-xs text-zinc-500">
-          Demo PINs: sales `2222`, supervisor `1234`
+          Demo PINs: store desk `3333`, supervisor `1234`
         </p>
       </div>
     </div>

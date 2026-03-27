@@ -58,7 +58,8 @@ const socketByRole = new Map();
 
 const ROLE_PINS = {
   supervisor: process.env.SUPERVISOR_PIN || "1234",
-  sales: process.env.SALES_PIN || "2222",
+  /** Store laptop: customer + sales headsets, same machine as Meet */
+  floor: process.env.FLOOR_PIN || "3333",
 };
 
 function broadcastState() {
@@ -96,6 +97,8 @@ function canToggleParticipant(socket, participantId) {
   const s = getSession(socket);
   if (!s) return false;
   if (s.role === "supervisor") return true;
+  if (s.role === "floor" && (participantId === "customer" || participantId === "sales"))
+    return true;
   return s.role === participantId;
 }
 
@@ -128,7 +131,7 @@ io.on("connection", (socket) => {
 
   socket.on("auth:login", ({ role, pin, name }) => {
     const normalizedRole = String(role || "").toLowerCase();
-    const validRoles = ["supervisor", "sales"];
+    const validRoles = ["supervisor", "floor"];
 
     if (!validRoles.includes(normalizedRole)) {
       socket.emit("auth:error", { message: "Invalid role" });
@@ -141,7 +144,7 @@ io.on("connection", (socket) => {
 
     const displayName =
       String(name || "").trim() ||
-      (normalizedRole === "supervisor" ? "Supervisor" : "Sales Executive");
+      (normalizedRole === "supervisor" ? "Supervisor" : "Store desk");
 
     const existingSocketForRole = socketByRole.get(normalizedRole);
     if (existingSocketForRole && existingSocketForRole !== socket.id) {
@@ -157,9 +160,13 @@ io.on("connection", (socket) => {
 
     updateState((prev) => ({
       ...prev,
-      participants: prev.participants.map((p) =>
-        p.id === normalizedRole ? { ...p, name: displayName } : p
-      ),
+      participants: prev.participants.map((p) => {
+        if (normalizedRole === "floor" && p.id === "sales") {
+          return { ...p, name: displayName };
+        }
+        if (p.id === normalizedRole) return { ...p, name: displayName };
+        return p;
+      }),
     }));
 
     socket.emit("auth:ok", { role: normalizedRole, name: displayName });
@@ -169,6 +176,7 @@ io.on("connection", (socket) => {
   socket.on("media:micState", ({ micOn }) => {
     const session = getSession(socket);
     if (!session) return;
+    if (session.role === "floor") return;
     setParticipantMic(session.role, Boolean(micOn));
   });
 
@@ -194,7 +202,7 @@ io.on("connection", (socket) => {
 
   socket.on("control:setRinging", ({ ringing }) => {
     const session = getSession(socket);
-    if (!session || (session.role !== "supervisor" && session.role !== "sales")) return;
+    if (!session || (session.role !== "supervisor" && session.role !== "floor")) return;
     updateState((prev) => ({ ...prev, ringing: Boolean(ringing) }));
   });
 

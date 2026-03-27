@@ -5,7 +5,9 @@ import AudioRoutingGraph from "./components/AudioRoutingGraph";
 import SupervisorControls from "./components/SupervisorControls";
 import BottomBar from "./components/BottomBar";
 import AuthPanel from "./components/AuthPanel";
+import FloorStationPanel from "./components/FloorStationPanel";
 import { createMixerSocket } from "./services/socket";
+import useLocalMixer from "./hooks/useLocalMixer";
 
 const initialState = {
   mode: "listen",
@@ -52,16 +54,25 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState("");
   const [mediaError, setMediaError] = useState("");
-  const [remoteStreams, setRemoteStreams] = useState([]);
+  const [floorInbound, setFloorInbound] = useState({ customer: null, sales: null });
   const socket = useMemo(() => createMixerSocket(), []);
   const localStreamRef = useRef(null);
   const peerConnectionsRef = useRef(new Map());
-  const audioRefs = useRef(new Map());
+  const audioFloorCustomerRef = useRef(null);
+  const audioFloorSalesRef = useRef(null);
+  const floorInboundOrderRef = useRef(0);
   const loginTimeoutRef = useRef(null);
+  const authRef = useRef(null);
+  authRef.current = auth;
 
   const isAuthed = Boolean(auth?.role);
   const isSupervisor = auth?.role === "supervisor";
-  const canRingBell = auth?.role === "supervisor" || auth?.role === "sales";
+  const isFloor = auth?.role === "floor";
+  const canRingBell = auth?.role === "supervisor" || auth?.role === "floor";
+  const localMixer = useLocalMixer({
+    connected: mixerState.connected,
+    mode: mixerState.mode,
+  });
 
   useEffect(() => {
     const handleConnect = () => setBackendConnected(true);
@@ -93,33 +104,77 @@ export default function App() {
     };
 
     const handleOffer = async ({ fromSocketId, fromRole, sdp }) => {
-      const pc = ensurePeerConnection(fromSocketId, fromRole);
+      if (!sdp || authRef.current?.role !== "supervisor" || fromRole !== "floor") return;
+      floorInboundOrderRef.current = 0;
+      setFloorInbound({ customer: null, sales: null });
+      const existing = peerConnectionsRef.current.get(fromSocketId);
+      if (existing) existing.close();
+
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      });
+      peerConnectionsRef.current.set(fromSocketId, pc);
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        socket.emit("webrtc:ice", {
+          targetSocketId: fromSocketId,
+          candidate: event.candidate,
+        });
+      };
+
+      pc.ontrack = (event) => {
+        const [stream] = event.streams;
+        if (!stream) return;
+        const idx = floorInboundOrderRef.current++;
+        const key = idx === 0 ? "customer" : "sales";
+        setFloorInbound((prev) => ({ ...prev, [key]: stream }));
+      };
+
       await pc.setRemoteDescription(sdp);
+      if (!localStreamRef.current) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+            video: false,
+          });
+          localStreamRef.current = stream;
+          setMediaError("");
+        } catch {
+          setMediaError("Supervisor microphone unavailable.");
+          return;
+        }
+      }
+      const track = localStreamRef.current.getAudioTracks()[0];
+      if (track) pc.addTrack(track, localStreamRef.current);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
     };
 
-    const handleAnswer = async ({ fromSocketId, sdp }) => {
-      const pc = peerConnectionsRef.current.get(fromSocketId);
-      if (!pc) return;
-      await pc.setRemoteDescription(sdp);
-    };
-
     const handleIce = async ({ fromSocketId, candidate }) => {
+      if (!candidate) return;
       const pc = peerConnectionsRef.current.get(fromSocketId);
       if (!pc) return;
-      await pc.addIceCandidate(candidate);
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch {
+        /* ignore */
+      }
     };
 
-    const handlePeerLeft = ({ socketId }) => {
+    const handlePeerLeft = ({ socketId, role }) => {
+      if (role !== "floor") return;
       const pc = peerConnectionsRef.current.get(socketId);
       if (pc) {
         pc.close();
         peerConnectionsRef.current.delete(socketId);
       }
-      setRemoteStreams((prev) => prev.filter((p) => p.socketId !== socketId));
-      audioRefs.current.delete(socketId);
+      setFloorInbound({ customer: null, sales: null });
     };
 
     socket.on("connect", handleConnect);
@@ -130,7 +185,6 @@ export default function App() {
     socket.on("auth:error", handleAuthError);
     socket.on("session:replaced", handleSessionReplaced);
     socket.on("webrtc:offer", handleOffer);
-    socket.on("webrtc:answer", handleAnswer);
     socket.on("webrtc:ice", handleIce);
     socket.on("peer:left", handlePeerLeft);
 
@@ -143,12 +197,12 @@ export default function App() {
       socket.off("auth:error", handleAuthError);
       socket.off("session:replaced", handleSessionReplaced);
       socket.off("webrtc:offer", handleOffer);
-      socket.off("webrtc:answer", handleAnswer);
       socket.off("webrtc:ice", handleIce);
       socket.off("peer:left", handlePeerLeft);
       cleanupPeers();
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((t) => t.stop());
+        localStreamRef.current = null;
       }
       if (loginTimeoutRef.current) {
         clearTimeout(loginTimeoutRef.current);
@@ -161,48 +215,7 @@ export default function App() {
   function cleanupPeers() {
     peerConnectionsRef.current.forEach((pc) => pc.close());
     peerConnectionsRef.current.clear();
-    setRemoteStreams([]);
-  }
-
-  function ensurePeerConnection(targetSocketId, targetRole) {
-    if (peerConnectionsRef.current.has(targetSocketId)) {
-      return peerConnectionsRef.current.get(targetSocketId);
-    }
-
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => {
-        pc.addTrack(track, localStreamRef.current);
-      });
-    }
-
-    pc.onicecandidate = (event) => {
-      if (!event.candidate) return;
-      socket.emit("webrtc:ice", {
-        targetSocketId,
-        candidate: event.candidate,
-      });
-    };
-
-    pc.ontrack = (event) => {
-      const [stream] = event.streams;
-      if (!stream) return;
-      setRemoteStreams((prev) => {
-        const exists = prev.find((p) => p.socketId === targetSocketId);
-        if (exists) {
-          return prev.map((p) =>
-            p.socketId === targetSocketId ? { ...p, role: targetRole, stream } : p
-          );
-        }
-        return [...prev, { socketId: targetSocketId, role: targetRole, stream }];
-      });
-    };
-
-    peerConnectionsRef.current.set(targetSocketId, pc);
-    return pc;
+    setFloorInbound({ customer: null, sales: null });
   }
 
   async function startLocalAudio() {
@@ -217,77 +230,50 @@ export default function App() {
       });
       localStreamRef.current = stream;
       setMediaError("");
-      socket.emit("media:micState", { micOn: true });
+      if (authRef.current?.role === "supervisor") {
+        socket.emit("media:micState", { micOn: true });
+      }
     } catch (error) {
       setMediaError("Microphone permission denied or unavailable.");
-      socket.emit("media:micState", { micOn: false });
+      if (authRef.current?.role === "supervisor") {
+        socket.emit("media:micState", { micOn: false });
+      }
     }
   }
 
   useEffect(() => {
-    if (!isAuthed) return;
+    if (!isAuthed || auth?.role !== "supervisor") return;
     if (!localStreamRef.current) {
       startLocalAudio();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAuthed]);
+  }, [isAuthed, auth?.role]);
 
   useEffect(() => {
-    if (!isAuthed || !backendConnected) return;
-    const currentPeers = presence.filter((p) => p.socketId !== socket.id);
-    currentPeers.forEach(async (peer) => {
-      const pc = ensurePeerConnection(peer.socketId, peer.role);
-      const shouldInitiate = socket.id > peer.socketId;
-      if (!shouldInitiate) return;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit("webrtc:offer", { targetSocketId: peer.socketId, sdp: offer });
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [presence, isAuthed, backendConnected]);
-
-  useEffect(() => {
-    if (!auth?.role) return;
-    const self = mixerState.participants.find((p) => p.id === auth.role);
+    if (auth?.role !== "supervisor") return;
+    const self = mixerState.participants.find((p) => p.id === "supervisor");
     const track = localStreamRef.current?.getAudioTracks?.()[0];
     if (track && self) {
       track.enabled = Boolean(self.micOn);
     }
-  }, [mixerState.participants, auth]);
+  }, [mixerState.participants, auth?.role]);
 
+  const vol = mixerState.connected ? 1 : 0;
   useEffect(() => {
-    const connected = mixerState.connected;
-    remoteStreams.forEach(({ socketId, role }) => {
-      const el = audioRefs.current.get(socketId);
-      if (!el) return;
-      el.volume = getPlaybackVolume({
-        viewerRole: auth?.role,
-        remoteRole: role,
-        mode: mixerState.mode,
-        connected,
-      });
-    });
-  }, [remoteStreams, mixerState.mode, mixerState.connected, auth]);
-
-  function getPlaybackVolume({ viewerRole, remoteRole, mode, connected }) {
-    if (!connected || !viewerRole || viewerRole === remoteRole) return 0;
-    if (viewerRole === "supervisor") {
-      return remoteRole === "customer" || remoteRole === "sales" ? 1 : 0;
+    if (auth?.role !== "supervisor") return;
+    const c = audioFloorCustomerRef.current;
+    const s = audioFloorSalesRef.current;
+    if (c && floorInbound.customer) {
+      c.srcObject = floorInbound.customer;
+      c.volume = vol;
+      c.play().catch(() => {});
     }
-    if (viewerRole === "customer") {
-      if (remoteRole === "sales") return 1;
-      if (remoteRole === "supervisor") {
-        return mode === "talk-customer" || mode === "talk-both" ? 1 : 0;
-      }
+    if (s && floorInbound.sales) {
+      s.srcObject = floorInbound.sales;
+      s.volume = vol;
+      s.play().catch(() => {});
     }
-    if (viewerRole === "sales") {
-      if (remoteRole === "customer") return 1;
-      if (remoteRole === "supervisor") {
-        return mode === "talk-sales" || mode === "talk-both" ? 1 : 0;
-      }
-    }
-    return 0;
-  }
+  }, [auth?.role, floorInbound.customer, floorInbound.sales, vol]);
 
   const handleLogin = ({ role, name, pin }) => {
     if (loginTimeoutRef.current) {
@@ -332,17 +318,21 @@ export default function App() {
   const isTalkToSales =
     mixerState.mode === "talk-sales" || mixerState.mode === "talk-both";
 
+  const useLiveLevels = isSupervisor && localMixer.running;
   const speaking = {
     customer:
-      mixerState.participants.find((p) => p.id === "customer")?.micOn &&
-      mixerState.connected,
-    sales:
-      mixerState.participants.find((p) => p.id === "sales")?.micOn &&
-      mixerState.connected,
-    supervisor:
-      mixerState.participants.find((p) => p.id === "supervisor")?.micOn &&
+      Boolean(mixerState.participants.find((p) => p.id === "customer")?.micOn) &&
       mixerState.connected &&
-      mixerState.mode !== "listen",
+      (useLiveLevels ? localMixer.levels.customer > 6 : true),
+    sales:
+      Boolean(mixerState.participants.find((p) => p.id === "sales")?.micOn) &&
+      mixerState.connected &&
+      (useLiveLevels ? localMixer.levels.sales > 6 : true),
+    supervisor:
+      Boolean(mixerState.participants.find((p) => p.id === "supervisor")?.micOn) &&
+      mixerState.connected &&
+      mixerState.mode !== "listen" &&
+      (useLiveLevels ? localMixer.levels.supervisor > 6 : true),
   };
 
   const routes = {
@@ -356,6 +346,12 @@ export default function App() {
   };
 
   const simulateLevels = () => {
+    if (localMixer.running) {
+      return {
+        l: localMixer.levels.monitorL,
+        r: localMixer.levels.monitorR,
+      };
+    }
     const t = Date.now() / 420;
     return {
       l: mixerState.connected
@@ -368,13 +364,25 @@ export default function App() {
   };
 
   const onToggleMic = (id) => {
-    if (!isSupervisor && id !== auth.role) return;
+    if (!isSupervisor && !isFloor && id !== auth.role) return;
+    if (isFloor && id !== "customer" && id !== "sales") return;
     socket.emit("control:toggleMic", { id });
   };
 
   return (
     <div className="flex h-full min-h-[720px] flex-col bg-surface p-3 md:p-4">
       <Header connected={mixerState.connected && backendConnected} />
+
+      {isFloor && (
+        <div className="mt-3 shrink-0">
+          <FloorStationPanel
+            socket={socket}
+            presence={presence}
+            mixerState={mixerState}
+            backendConnected={backendConnected}
+          />
+        </div>
+      )}
 
       <main className="mt-3 grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[260px_minmax(0,1.35fr)_280px] lg:gap-4 lg:items-stretch">
         <ParticipantsSidebar
@@ -383,7 +391,7 @@ export default function App() {
           onToggleMic={onToggleMic}
           focusOn={mixerState.focusOn}
           currentRole={auth.role}
-          canToggleAll={isSupervisor}
+          canToggleAll={isSupervisor || isFloor}
         />
         <AudioRoutingGraph routes={routes} mode={mixerState.mode} />
         <SupervisorControls
@@ -408,6 +416,17 @@ export default function App() {
           liveLevels={simulateLevels}
           connected={mixerState.connected && backendConnected}
           canManage={isSupervisor}
+          inputDevices={isSupervisor ? localMixer.inputDevices : []}
+          selectedInputs={isSupervisor ? localMixer.selectedInputs : {}}
+          onSelectInput={(role, deviceId) =>
+            isSupervisor &&
+            localMixer.setSelectedInputs((prev) => ({ ...prev, [role]: deviceId }))
+          }
+          onStartMixer={isSupervisor ? localMixer.start : () => {}}
+          onStopMixer={isSupervisor ? localMixer.stop : () => {}}
+          mixerRunning={isSupervisor && localMixer.running}
+          mixerError={isSupervisor ? localMixer.error : ""}
+          floorHint={isFloor}
         />
       </main>
 
@@ -440,18 +459,12 @@ export default function App() {
         canManage={isSupervisor}
       />
 
-      {remoteStreams.map(({ socketId, stream }) => (
-        <audio
-          key={socketId}
-          autoPlay
-          playsInline
-          ref={(el) => {
-            if (!el) return;
-            el.srcObject = stream;
-            audioRefs.current.set(socketId, el);
-          }}
-        />
-      ))}
+      {isSupervisor && (
+        <>
+          <audio ref={audioFloorCustomerRef} className="hidden" playsInline autoPlay />
+          <audio ref={audioFloorSalesRef} className="hidden" playsInline autoPlay />
+        </>
+      )}
     </div>
   );
 }
