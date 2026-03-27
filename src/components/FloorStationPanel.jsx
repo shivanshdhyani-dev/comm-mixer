@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getIceServers } from "../webrtcConfig";
+import {
+  checkLocalMixerHealth,
+  openLocalMixerStream,
+  startLocalMixerCapture,
+  stopLocalMixerCapture,
+} from "../services/localMixerBridge";
 
 /**
  * Store laptop: two headset mics (customer + sales) → supervisor;
@@ -20,6 +26,9 @@ export default function FloorStationPanel({
   const [status, setStatus] = useState("");
   const [linking, setLinking] = useState(false);
   const [inputLevels, setInputLevels] = useState({ customer: 0, sales: 0 });
+  const [useLocalMixer, setUseLocalMixer] = useState(true);
+  const [localMixerAvailable, setLocalMixerAvailable] = useState(false);
+  const [localMixerBusy, setLocalMixerBusy] = useState(false);
 
   const pcRef = useRef(null);
   const customerStreamRef = useRef(null);
@@ -28,6 +37,8 @@ export default function FloorStationPanel({
   const captureMixCtxRef = useRef(null);
   const meterRafRef = useRef(null);
   const meterCtxRef = useRef(null);
+  const localMixerBridgeRef = useRef(null);
+  const lastUsedLocalMixerRef = useRef(false);
   const supervisorStreamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const gainCustomerRef = useRef(null);
@@ -36,6 +47,11 @@ export default function FloorStationPanel({
   const outAudioSalesRef = useRef(null);
 
   const supervisor = presence.find((p) => p.role === "supervisor");
+
+  const getInputLabelById = useCallback(
+    (deviceId) => inputs.find((d) => d.deviceId === deviceId)?.label || "",
+    [inputs]
+  );
 
   const refreshDevices = useCallback(async () => {
     const list = await navigator.mediaDevices.enumerateDevices();
@@ -55,6 +71,27 @@ export default function FloorStationPanel({
     if (inputs.length && !micSales)
       setMicSales(inputs[1]?.deviceId || inputs[0]?.deviceId || "");
   }, [inputs, micCustomer, micSales]);
+
+  const refreshLocalMixerHealth = useCallback(async () => {
+    setLocalMixerBusy(true);
+    try {
+      const health = await checkLocalMixerHealth();
+      setLocalMixerAvailable(Boolean(health?.ok));
+    } catch {
+      setLocalMixerAvailable(false);
+    } finally {
+      setLocalMixerBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!useLocalMixer) return;
+    refreshLocalMixerHealth().catch(() => {});
+    const id = window.setInterval(() => {
+      refreshLocalMixerHealth().catch(() => {});
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [refreshLocalMixerHealth, useLocalMixer]);
 
   const teardownPlaybackOnly = useCallback(() => {
     supervisorStreamRef.current = null;
@@ -89,6 +126,14 @@ export default function FloorStationPanel({
     if (meterCtxRef.current) {
       meterCtxRef.current.close();
       meterCtxRef.current = null;
+    }
+    if (localMixerBridgeRef.current) {
+      localMixerBridgeRef.current.close();
+      localMixerBridgeRef.current = null;
+    }
+    if (lastUsedLocalMixerRef.current) {
+      stopLocalMixerCapture().catch(() => {});
+      lastUsedLocalMixerRef.current = false;
     }
     setInputLevels({ customer: 0, sales: 0 });
     teardownPlaybackOnly();
@@ -254,36 +299,45 @@ export default function FloorStationPanel({
     teardown();
 
     try {
-      const cStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: { exact: micCustomer },
-          // Disable voice-processing to reduce single-mic takeover behavior.
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1,
-        },
-        video: false,
-      });
-      const sStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: { exact: micSales },
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1,
-        },
-        video: false,
-      });
-      const cTrack = cStream.getAudioTracks()[0];
-      const sTrack = sStream.getAudioTracks()[0];
-      if (!cTrack || !sTrack) {
-        throw new Error("One or both selected microphones are unavailable.");
+      const shouldUseLocalMixer = useLocalMixer && localMixerAvailable;
+      let cStream = null;
+      let sStream = null;
+      lastUsedLocalMixerRef.current = shouldUseLocalMixer;
+
+      if (!shouldUseLocalMixer) {
+        cStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: { exact: micCustomer },
+            // Disable voice-processing to reduce single-mic takeover behavior.
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1,
+          },
+          video: false,
+        });
+        sStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: { exact: micSales },
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1,
+          },
+          video: false,
+        });
+        const cTrack = cStream.getAudioTracks()[0];
+        const sTrack = sStream.getAudioTracks()[0];
+        if (!cTrack || !sTrack) {
+          throw new Error("One or both selected microphones are unavailable.");
+        }
+        customerStreamRef.current = cStream;
+        salesStreamRef.current = sStream;
+        startMeters(cStream, sStream);
+        applyMicMutes();
+      } else {
+        setInputLevels({ customer: 0, sales: 0 });
       }
-      customerStreamRef.current = cStream;
-      salesStreamRef.current = sStream;
-      startMeters(cStream, sStream);
-      applyMicMutes();
 
       const pc = new RTCPeerConnection({
         iceServers: getIceServers(),
@@ -305,20 +359,34 @@ export default function FloorStationPanel({
         }
       };
 
-      // Mix both headset mics into one outgoing channel to avoid multi-track
-      // device capture inconsistencies on single-laptop store setups.
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const mixCtx = new AudioCtx();
-      captureMixCtxRef.current = mixCtx;
-      void mixCtx.resume().catch(() => {});
-      const dest = mixCtx.createMediaStreamDestination();
-      const cSrc = mixCtx.createMediaStreamSource(cStream);
-      const sSrc = mixCtx.createMediaStreamSource(sStream);
-      cSrc.connect(dest);
-      sSrc.connect(dest);
-      mixedOutStreamRef.current = dest.stream;
-      const mixedTrack = dest.stream.getAudioTracks()[0];
-      if (mixedTrack) pc.addTrack(mixedTrack, dest.stream);
+      if (shouldUseLocalMixer) {
+        const customerName = getInputLabelById(micCustomer);
+        const salesName = getInputLabelById(micSales);
+        await startLocalMixerCapture({
+          mic1: customerName || micCustomer,
+          mic2: salesName || micSales,
+        });
+        const bridge = openLocalMixerStream();
+        localMixerBridgeRef.current = bridge;
+        mixedOutStreamRef.current = bridge.stream;
+        const track = bridge.stream.getAudioTracks()[0];
+        if (track) pc.addTrack(track, bridge.stream);
+      } else {
+        // Mix both headset mics into one outgoing channel to avoid multi-track
+        // device capture inconsistencies on single-laptop store setups.
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const mixCtx = new AudioCtx();
+        captureMixCtxRef.current = mixCtx;
+        void mixCtx.resume().catch(() => {});
+        const dest = mixCtx.createMediaStreamDestination();
+        const cSrc = mixCtx.createMediaStreamSource(cStream);
+        const sSrc = mixCtx.createMediaStreamSource(sStream);
+        cSrc.connect(dest);
+        sSrc.connect(dest);
+        mixedOutStreamRef.current = dest.stream;
+        const mixedTrack = dest.stream.getAudioTracks()[0];
+        if (mixedTrack) pc.addTrack(mixedTrack, dest.stream);
+      }
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -326,17 +394,23 @@ export default function FloorStationPanel({
         targetSocketId: supervisor.socketId,
         sdp: offer,
       });
-      setTimeout(() => {
-        setInputLevels((levels) => {
-          if (levels.customer < 4 || levels.sales < 4) {
-            setStatus(
-              "One selected mic looks inactive. Check mic selection and speak closer to each mic."
-            );
-          }
-          return levels;
-        });
-      }, 1600);
-      setStatus("Offer sent — waiting for supervisor…");
+      if (!shouldUseLocalMixer) {
+        setTimeout(() => {
+          setInputLevels((levels) => {
+            if (levels.customer < 4 || levels.sales < 4) {
+              setStatus(
+                "One selected mic looks inactive. Check mic selection and speak closer to each mic."
+              );
+            }
+            return levels;
+          });
+        }, 1600);
+      }
+      setStatus(
+        shouldUseLocalMixer
+          ? "Offer sent (store audio service) — waiting for supervisor…"
+          : "Offer sent — waiting for supervisor…"
+      );
     } catch (e) {
       setStatus(
         e?.message
@@ -421,6 +495,27 @@ export default function FloorStationPanel({
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
+        <label className="mr-2 inline-flex items-center gap-2 text-xs text-zinc-400">
+          <input
+            type="checkbox"
+            checked={useLocalMixer}
+            onChange={(e) => setUseLocalMixer(e.target.checked)}
+          />
+          Use store audio service
+        </label>
+        {useLocalMixer && (
+          <span
+            className={`text-xs ${
+              localMixerAvailable ? "text-emerald-300" : "text-amber-300"
+            }`}
+          >
+            {localMixerBusy
+              ? "Checking store audio service..."
+              : localMixerAvailable
+                ? "Store audio service reachable"
+                : "Service offline: browser fallback will be used"}
+          </span>
+        )}
         <button
           type="button"
           disabled={linking || !backendConnected || !supervisor}

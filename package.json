@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "server": "node backend/server.js",
+    "local-mixer": "npm --prefix local-mixer start",
     "dev:full": "concurrently \"npm run server\" \"vite --host\"",
     "build": "vite build",
     "preview": "vite preview"
