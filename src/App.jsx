@@ -55,6 +55,8 @@ export default function App() {
   const [authError, setAuthError] = useState("");
   const [mediaError, setMediaError] = useState("");
   const [floorInbound, setFloorInbound] = useState({ customer: null, sales: null });
+  const [floorConnectionState, setFloorConnectionState] = useState("");
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const socket = useMemo(() => createMixerSocket(), []);
   const localStreamRef = useRef(null);
   const peerConnectionsRef = useRef(new Map());
@@ -101,59 +103,80 @@ export default function App() {
 
     const handleOffer = async ({ fromSocketId, fromRole, sdp }) => {
       if (!sdp || authRef.current?.role !== "supervisor" || fromRole !== "floor") return;
-      floorInboundOrderRef.current = 0;
-      setFloorInbound({ customer: null, sales: null });
-      const existing = peerConnectionsRef.current.get(fromSocketId);
-      if (existing) existing.close();
 
-      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
-      peerConnectionsRef.current.set(fromSocketId, pc);
+      try {
+        floorInboundOrderRef.current = 0;
+        setFloorInbound({ customer: null, sales: null });
+        setFloorConnectionState("connecting");
 
-      pc.onicecandidate = (event) => {
-        if (!event.candidate) return;
-        socket.emit("webrtc:ice", {
-          targetSocketId: fromSocketId,
-          candidate: event.candidate,
-        });
-      };
+        const existing = peerConnectionsRef.current.get(fromSocketId);
+        if (existing) existing.close();
 
-      pc.ontrack = (event) => {
-        const [stream] = event.streams;
-        if (!stream) return;
-        const idx = floorInboundOrderRef.current++;
-        if (idx === 0) {
-          setFloorInbound({ customer: stream, sales: stream });
-          return;
-        }
-        setFloorInbound((prev) => ({ ...prev, sales: stream }));
-      };
+        const pc = new RTCPeerConnection({ iceServers: getIceServers() });
+        peerConnectionsRef.current.set(fromSocketId, pc);
 
-      await pc.setRemoteDescription(sdp);
+        pc.oniceconnectionstatechange = () => {
+          const state = pc.iceConnectionState;
+          console.log("[Supervisor] ICE connection state:", state);
+          setFloorConnectionState(state);
+        };
 
-      if (!localStreamRef.current) {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-            video: false,
+        pc.onicecandidate = (event) => {
+          if (!event.candidate) return;
+          socket.emit("webrtc:ice", {
+            targetSocketId: fromSocketId,
+            candidate: event.candidate,
           });
-          localStreamRef.current = stream;
-          setMediaError("");
-          socket.emit("media:micState", { micOn: true });
-        } catch {
-          setMediaError("Supervisor microphone unavailable.");
-          return;
-        }
-      }
+        };
 
-      const track = localStreamRef.current.getAudioTracks()[0];
-      if (track) pc.addTrack(track, localStreamRef.current);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
+        pc.ontrack = (event) => {
+          const [stream] = event.streams;
+          if (!stream) return;
+          const idx = floorInboundOrderRef.current++;
+          if (idx === 0) {
+            setFloorInbound({ customer: stream, sales: stream });
+            return;
+          }
+          setFloorInbound((prev) => ({ ...prev, sales: stream }));
+        };
+
+        await pc.setRemoteDescription(sdp);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
+        console.log("[Supervisor] Answer sent to floor");
+
+        if (!localStreamRef.current) {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+              },
+              video: false,
+            });
+            localStreamRef.current = stream;
+            setMediaError("");
+            socket.emit("media:micState", { micOn: true });
+          } catch (micErr) {
+            console.warn("[Supervisor] Mic unavailable (talk-back disabled):", micErr.message);
+            setMediaError("Supervisor mic unavailable — you can hear floor but cannot talk back.");
+          }
+        }
+
+        if (localStreamRef.current) {
+          const track = localStreamRef.current.getAudioTracks()[0];
+          if (track) {
+            pc.addTrack(track, localStreamRef.current);
+          }
+        }
+      } catch (err) {
+        console.error("[Supervisor] handleOffer failed:", err);
+        setMediaError("Failed to establish connection with floor: " + err.message);
+        setFloorConnectionState("failed");
+      }
     };
 
     const handleIce = async ({ fromSocketId, candidate }) => {
@@ -264,7 +287,6 @@ export default function App() {
     }
   }, [mixerState.participants, auth?.role]);
 
-  // Play floor audio on supervisor side
   const vol = mixerState.connected ? 1 : 0;
   useEffect(() => {
     if (auth?.role !== "supervisor") return;
@@ -272,15 +294,20 @@ export default function App() {
     const s = audioFloorSalesRef.current;
     const tryPlay = (el) => {
       if (!el) return;
-      el.play().catch(() => {
-        const once = () => {
-          el.play().catch(() => {});
-          document.removeEventListener("click", once);
-          document.removeEventListener("keydown", once);
-        };
-        document.addEventListener("click", once);
-        document.addEventListener("keydown", once);
-      });
+      el.play()
+        .then(() => setAutoplayBlocked(false))
+        .catch(() => {
+          setAutoplayBlocked(true);
+          const once = () => {
+            el.play()
+              .then(() => setAutoplayBlocked(false))
+              .catch(() => {});
+            document.removeEventListener("click", once);
+            document.removeEventListener("keydown", once);
+          };
+          document.addEventListener("click", once);
+          document.addEventListener("keydown", once);
+        });
     };
     if (c && floorInbound.customer) {
       c.srcObject = floorInbound.customer;
@@ -428,6 +455,31 @@ export default function App() {
           floorHint={isFloor}
         />
       </main>
+
+      {autoplayBlocked && isSupervisor && (
+        <div
+          className="mt-2 cursor-pointer rounded-lg bg-yellow-600/90 px-4 py-2 text-center text-sm font-medium text-white"
+          onClick={() => {
+            [audioFloorCustomerRef, audioFloorSalesRef].forEach((ref) => {
+              ref.current?.play()
+                .then(() => setAutoplayBlocked(false))
+                .catch(() => {});
+            });
+          }}
+        >
+          Browser blocked audio playback — click here to enable audio
+        </div>
+      )}
+
+      {isSupervisor && floorConnectionState && (
+        <p className={`mt-1 text-center text-xs font-medium ${
+          floorConnectionState === "connected" ? "text-green-400" :
+          floorConnectionState === "failed" || floorConnectionState === "disconnected" ? "text-red-400" :
+          "text-yellow-400"
+        }`}>
+          Floor connection: {floorConnectionState}
+        </p>
+      )}
 
       {mediaError && (
         <p className="mt-2 text-center text-sm text-red-400">{mediaError}</p>

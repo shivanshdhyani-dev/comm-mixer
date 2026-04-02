@@ -317,11 +317,21 @@ export default function FloorStationPanel({
       customerStreamRef.current = cStream;
       salesStreamRef.current = sStream;
 
-      // 3) Start level meters so you can see both mics are alive
+      const cActualId = cTrack.getSettings().deviceId;
+      const sActualId = sTrack.getSettings().deviceId;
+      if (cActualId && sActualId && cActualId === sActualId) {
+        setStatus(
+          `Warning: Both mics resolved to the same hardware device ("${cTrack.label}"). ` +
+          "Pick two physically separate headsets."
+        );
+      } else {
+        console.log("[Floor] Customer mic:", cTrack.label, "| Sales mic:", sTrack.label);
+        setStatus(`Capturing: "${cTrack.label}" + "${sTrack.label}"`);
+      }
+
       startMeters(cStream, sStream);
       applyMicMutes();
 
-      // 4) Mix both mics into one stream via Web Audio
       setStatus("Mixing audio…");
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const mixCtx = new AudioCtx();
@@ -362,13 +372,16 @@ export default function FloorStationPanel({
 
       pc.oniceconnectionstatechange = () => {
         const state = pc.iceConnectionState;
+        console.log("[Floor] ICE connection state:", state);
         if (state === "connected" || state === "completed") {
           setStatus("Connected — supervisor hearing both mics");
           setLinked(true);
+        } else if (state === "checking") {
+          setStatus("Connecting to supervisor…");
         } else if (state === "disconnected") {
           setStatus("Connection interrupted — trying to reconnect…");
         } else if (state === "failed") {
-          setStatus("Connection failed. Try again.");
+          setStatus("Connection failed — TURN relay may be down. Try again.");
           setLinked(false);
         }
       };
@@ -385,17 +398,18 @@ export default function FloorStationPanel({
 
       setStatus("Offer sent — waiting for supervisor…");
 
-      // 7) After 2 seconds, check if both mics show activity
+      const customerLabel = cTrack.label || "Customer mic";
+      const salesLabel = sTrack.label || "Sales mic";
       setTimeout(() => {
         setInputLevels((levels) => {
           if (levels.customer < 3 && levels.sales < 3) {
             setStatus(
-              "Both mics look silent. Check headset connections and speak into each mic."
+              `Both mics silent. Check headset connections — "${customerLabel}" and "${salesLabel}".`
             );
           } else if (levels.customer < 3) {
-            setStatus("Customer mic looks silent. Check the customer headset connection.");
+            setStatus(`"${customerLabel}" looks silent — check the customer headset connection.`);
           } else if (levels.sales < 3) {
-            setStatus("Sales mic looks silent. Check the sales headset connection.");
+            setStatus(`"${salesLabel}" looks silent — check the sales headset connection.`);
           }
           return levels;
         });
