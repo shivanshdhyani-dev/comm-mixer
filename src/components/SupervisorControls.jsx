@@ -28,10 +28,8 @@ function ChannelMeter({ label, value, onChange, gradient }) {
         aria-valuemax={100}
         tabIndex={0}
         onKeyDown={(e) => {
-          if (e.key === "ArrowLeft")
-            onChange(Math.max(0, value - 5));
-          if (e.key === "ArrowRight")
-            onChange(Math.min(100, value + 5));
+          if (e.key === "ArrowLeft") onChange(Math.max(0, value - 5));
+          if (e.key === "ArrowRight") onChange(Math.min(100, value + 5));
         }}
       >
         <motion.div
@@ -63,13 +61,6 @@ export default function SupervisorControls({
   liveLevels,
   connected,
   canManage,
-  inputDevices,
-  selectedInputs,
-  onSelectInput,
-  onStartMixer,
-  onStopMixer,
-  mixerRunning,
-  mixerError,
   floorHint,
 }) {
   const [displayL, setDisplayL] = useState(channelL);
@@ -110,65 +101,7 @@ export default function SupervisorControls({
             Read-only: supervisor permissions required.
           </div>
         )}
-        {!floorHint && (
-          <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
-            <p className="mb-2 text-xs font-medium text-zinc-400">Input devices (real mixer)</p>
-            <div className="grid gap-2">
-              <select
-                value={selectedInputs.customer}
-                onChange={(e) => onSelectInput("customer", e.target.value)}
-                className="rounded-lg border border-white/10 bg-black/30 px-2.5 py-2 text-xs text-zinc-200"
-              >
-                {inputDevices.map((d) => (
-                  <option key={`c-${d.deviceId}`} value={d.deviceId}>
-                    Customer: {d.label || "Microphone"}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={selectedInputs.sales}
-                onChange={(e) => onSelectInput("sales", e.target.value)}
-                className="rounded-lg border border-white/10 bg-black/30 px-2.5 py-2 text-xs text-zinc-200"
-              >
-                {inputDevices.map((d) => (
-                  <option key={`s-${d.deviceId}`} value={d.deviceId}>
-                    Sales: {d.label || "Microphone"}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={selectedInputs.supervisor}
-                onChange={(e) => onSelectInput("supervisor", e.target.value)}
-                className="rounded-lg border border-white/10 bg-black/30 px-2.5 py-2 text-xs text-zinc-200"
-              >
-                {inputDevices.map((d) => (
-                  <option key={`sv-${d.deviceId}`} value={d.deviceId}>
-                    Supervisor: {d.label || "Microphone"}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="mt-2 flex gap-2">
-              <button
-                type="button"
-                onClick={onStartMixer}
-                className="rounded-lg border border-accent-teal/40 bg-accent-teal/15 px-3 py-1.5 text-xs text-accent-teal"
-              >
-                {mixerRunning ? "Restart Mixer" : "Start Mixer"}
-              </button>
-              {mixerRunning && (
-                <button
-                  type="button"
-                  onClick={onStopMixer}
-                  className="rounded-lg border border-white/15 bg-white/[0.03] px-3 py-1.5 text-xs text-zinc-300"
-                >
-                  Stop
-                </button>
-              )}
-            </div>
-            {mixerError && <p className="mt-2 text-xs text-red-400">{mixerError}</p>}
-          </div>
-        )}
+
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">
             Combined audio channel

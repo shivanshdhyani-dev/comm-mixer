@@ -1,15 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getIceServers } from "../webrtcConfig";
-import {
-  checkLocalMixerHealth,
-  openLocalMixerStream,
-  startLocalMixerCapture,
-  stopLocalMixerCapture,
-} from "../services/localMixerBridge";
 
 /**
- * Store laptop: two headset mics (customer + sales) → supervisor;
- * supervisor talk-back → split to customer vs sales headset outputs.
+ * Store laptop: two headset mics (customer + sales) → mixed into one stream → supervisor.
+ * Supervisor talk-back → split to customer vs sales headset outputs via setSinkId.
  */
 export default function FloorStationPanel({
   socket,
@@ -25,11 +19,8 @@ export default function FloorStationPanel({
   const [sinkSales, setSinkSales] = useState("");
   const [status, setStatus] = useState("");
   const [linking, setLinking] = useState(false);
+  const [linked, setLinked] = useState(false);
   const [inputLevels, setInputLevels] = useState({ customer: 0, sales: 0 });
-  /** Off by default: live sites rarely have local-mixer running; avoids /health spam in console. */
-  const [useLocalMixer, setUseLocalMixer] = useState(false);
-  const [localMixerAvailable, setLocalMixerAvailable] = useState(false);
-  const [localMixerBusy, setLocalMixerBusy] = useState(false);
 
   const pcRef = useRef(null);
   const customerStreamRef = useRef(null);
@@ -38,8 +29,6 @@ export default function FloorStationPanel({
   const captureMixCtxRef = useRef(null);
   const meterRafRef = useRef(null);
   const meterCtxRef = useRef(null);
-  const localMixerBridgeRef = useRef(null);
-  const lastUsedLocalMixerRef = useRef(false);
   const supervisorStreamRef = useRef(null);
   const audioCtxRef = useRef(null);
   const gainCustomerRef = useRef(null);
@@ -49,10 +38,7 @@ export default function FloorStationPanel({
 
   const supervisor = presence.find((p) => p.role === "supervisor");
 
-  const getInputLabelById = useCallback(
-    (deviceId) => inputs.find((d) => d.deviceId === deviceId)?.label || "",
-    [inputs]
-  );
+  // ─── Device enumeration ───
 
   const refreshDevices = useCallback(async () => {
     const list = await navigator.mediaDevices.enumerateDevices();
@@ -73,29 +59,9 @@ export default function FloorStationPanel({
       setMicSales(inputs[1]?.deviceId || inputs[0]?.deviceId || "");
   }, [inputs, micCustomer, micSales]);
 
-  const refreshLocalMixerHealth = useCallback(async () => {
-    setLocalMixerBusy(true);
-    try {
-      const health = await checkLocalMixerHealth();
-      setLocalMixerAvailable(Boolean(health?.ok));
-    } catch {
-      setLocalMixerAvailable(false);
-    } finally {
-      setLocalMixerBusy(false);
-    }
-  }, []);
+  // ─── Teardown helpers ───
 
-  useEffect(() => {
-    if (!useLocalMixer) return;
-    refreshLocalMixerHealth().catch(() => {});
-    const ms = localMixerAvailable ? 8000 : 25000;
-    const id = window.setInterval(() => {
-      refreshLocalMixerHealth().catch(() => {});
-    }, ms);
-    return () => window.clearInterval(id);
-  }, [refreshLocalMixerHealth, useLocalMixer, localMixerAvailable]);
-
-  const teardownPlaybackOnly = useCallback(() => {
+  const teardownPlayback = useCallback(() => {
     supervisorStreamRef.current = null;
     if (audioCtxRef.current) {
       audioCtxRef.current.close();
@@ -129,17 +95,12 @@ export default function FloorStationPanel({
       meterCtxRef.current.close();
       meterCtxRef.current = null;
     }
-    if (localMixerBridgeRef.current) {
-      localMixerBridgeRef.current.close();
-      localMixerBridgeRef.current = null;
-    }
-    if (lastUsedLocalMixerRef.current) {
-      stopLocalMixerCapture().catch(() => {});
-      lastUsedLocalMixerRef.current = false;
-    }
     setInputLevels({ customer: 0, sales: 0 });
-    teardownPlaybackOnly();
-  }, [teardownPlaybackOnly]);
+    setLinked(false);
+    teardownPlayback();
+  }, [teardownPlayback]);
+
+  // ─── Level meters ───
 
   const startMeters = useCallback((cStream, sStream) => {
     if (meterRafRef.current) cancelAnimationFrame(meterRafRef.current);
@@ -159,28 +120,32 @@ export default function FloorStationPanel({
     const cData = new Uint8Array(cAn.fftSize);
     const sData = new Uint8Array(sAn.fftSize);
 
+    const rms = (arr) => {
+      let sum = 0;
+      for (let i = 0; i < arr.length; i += 1) {
+        const v = (arr[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / arr.length);
+    };
+
     const tick = () => {
       cAn.getByteTimeDomainData(cData);
       sAn.getByteTimeDomainData(sData);
-      const rms = (arr) => {
-        let sum = 0;
-        for (let i = 0; i < arr.length; i += 1) {
-          const v = (arr[i] - 128) / 128;
-          sum += v * v;
-        }
-        return Math.sqrt(sum / arr.length);
-      };
-      const cLevel = Math.min(100, Math.round(rms(cData) * 240));
-      const sLevel = Math.min(100, Math.round(rms(sData) * 240));
-      setInputLevels({ customer: cLevel, sales: sLevel });
+      setInputLevels({
+        customer: Math.min(100, Math.round(rms(cData) * 240)),
+        sales: Math.min(100, Math.round(rms(sData) * 240)),
+      });
       meterRafRef.current = requestAnimationFrame(tick);
     };
     meterRafRef.current = requestAnimationFrame(tick);
   }, []);
 
+  // ─── Supervisor talk-back → headset outputs ───
+
   const buildTalkbackGraph = useCallback(
     (supervisorStream) => {
-      teardownPlaybackOnly();
+      teardownPlayback();
       supervisorStreamRef.current = supervisorStream;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       const ctx = new AudioCtx();
@@ -204,29 +169,26 @@ export default function FloorStationPanel({
         elC.srcObject = destC.stream;
         elC.autoplay = true;
         elC.play().catch(() => {});
-        if (sinkCustomer && elC.setSinkId) {
-          elC.setSinkId(sinkCustomer).catch(() => {});
-        }
+        if (sinkCustomer && elC.setSinkId) elC.setSinkId(sinkCustomer).catch(() => {});
       }
       if (elS) {
         elS.srcObject = destS.stream;
         elS.autoplay = true;
         elS.play().catch(() => {});
-        if (sinkSales && elS.setSinkId) {
-          elS.setSinkId(sinkSales).catch(() => {});
-        }
+        if (sinkSales && elS.setSinkId) elS.setSinkId(sinkSales).catch(() => {});
       }
     },
-    [sinkCustomer, sinkSales, teardownPlaybackOnly]
+    [sinkCustomer, sinkSales, teardownPlayback]
   );
+
+  // ─── React to supervisor mode changes (talk-back gain) ───
 
   useEffect(() => {
     const mode = mixerState.mode;
-    const listen = mode === "listen";
     const gC = gainCustomerRef.current;
     const gS = gainSalesRef.current;
     if (!gC || !gS) return;
-    if (listen) {
+    if (mode === "listen") {
       gC.gain.value = 0;
       gS.gain.value = 0;
       return;
@@ -242,6 +204,8 @@ export default function FloorStationPanel({
     if (elS && sinkSales && elS.setSinkId) elS.setSinkId(sinkSales).catch(() => {});
   }, [sinkCustomer, sinkSales]);
 
+  // ─── Mic mute sync ───
+
   const applyMicMutes = useCallback(() => {
     const cust = mixerState.participants.find((p) => p.id === "customer");
     const sale = mixerState.participants.find((p) => p.id === "sales");
@@ -255,6 +219,8 @@ export default function FloorStationPanel({
     applyMicMutes();
   }, [applyMicMutes]);
 
+  // ─── WebRTC answer / ICE from supervisor ───
+
   useEffect(() => {
     const onAnswer = async ({ fromSocketId, sdp }) => {
       if (!supervisor || fromSocketId !== supervisor.socketId) return;
@@ -262,9 +228,10 @@ export default function FloorStationPanel({
       if (!pc || !sdp) return;
       try {
         await pc.setRemoteDescription(sdp);
-        setStatus("Linked with supervisor");
+        setStatus("Linked with supervisor — both mics streaming");
+        setLinked(true);
       } catch {
-        setStatus("Failed to apply answer");
+        setStatus("Failed to apply answer from supervisor");
       }
     };
 
@@ -287,6 +254,8 @@ export default function FloorStationPanel({
     };
   }, [socket, supervisor]);
 
+  // ─── Core: start link ───
+
   const startLink = async () => {
     if (!supervisor) {
       setStatus("Supervisor is not online yet.");
@@ -296,20 +265,75 @@ export default function FloorStationPanel({
       setStatus("Select both headset microphones.");
       return;
     }
+    if (micCustomer === micSales) {
+      setStatus("Customer and Sales must use different microphones.");
+      return;
+    }
+
     setLinking(true);
-    setStatus("Connecting…");
+    setStatus("Requesting microphone access…");
     teardown();
 
     try {
-      const tryStoreAudioFirst = useLocalMixer && localMixerAvailable;
-      let cStream = null;
-      let sStream = null;
-      let usedStoreAudio = false;
-      lastUsedLocalMixerRef.current = false;
-
-      const pc = new RTCPeerConnection({
-        iceServers: getIceServers(),
+      // 1) Capture customer mic
+      const cStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: micCustomer },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+        },
+        video: false,
       });
+
+      // 2) Capture sales mic
+      const sStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: micSales },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+        },
+        video: false,
+      });
+
+      const cTrack = cStream.getAudioTracks()[0];
+      const sTrack = sStream.getAudioTracks()[0];
+      if (!cTrack || !sTrack) {
+        throw new Error("One or both selected microphones are unavailable.");
+      }
+
+      customerStreamRef.current = cStream;
+      salesStreamRef.current = sStream;
+
+      // 3) Start level meters so you can see both mics are alive
+      startMeters(cStream, sStream);
+      applyMicMutes();
+
+      // 4) Mix both mics into one stream via Web Audio
+      setStatus("Mixing audio…");
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const mixCtx = new AudioCtx();
+      captureMixCtxRef.current = mixCtx;
+      await mixCtx.resume();
+
+      const dest = mixCtx.createMediaStreamDestination();
+      const cSrc = mixCtx.createMediaStreamSource(cStream);
+      const sSrc = mixCtx.createMediaStreamSource(sStream);
+      cSrc.connect(dest);
+      sSrc.connect(dest);
+      mixedOutStreamRef.current = dest.stream;
+
+      const mixedTrack = dest.stream.getAudioTracks()[0];
+      if (!mixedTrack) {
+        throw new Error("Failed to create mixed audio track.");
+      }
+
+      // 5) Create WebRTC peer connection
+      setStatus("Setting up WebRTC…");
+      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
       pcRef.current = pc;
 
       pc.onicecandidate = (e) => {
@@ -327,79 +351,21 @@ export default function FloorStationPanel({
         }
       };
 
-      if (tryStoreAudioFirst) {
-        try {
-          const customerName = getInputLabelById(micCustomer);
-          const salesName = getInputLabelById(micSales);
-          await startLocalMixerCapture({
-            mic1: customerName || micCustomer,
-            mic2: salesName || micSales,
-          });
-          const bridge = openLocalMixerStream();
-          const track = bridge.stream.getAudioTracks()[0];
-          if (!track) {
-            bridge.close();
-            throw new Error("no track from store service");
-          }
-          localMixerBridgeRef.current = bridge;
-          mixedOutStreamRef.current = bridge.stream;
-          pc.addTrack(track, bridge.stream);
-          usedStoreAudio = true;
-          lastUsedLocalMixerRef.current = true;
-          setInputLevels({ customer: 0, sales: 0 });
-        } catch (err) {
-          const msg = err?.message || "store audio failed";
-          setStatus(
-            `Store audio service unavailable (${msg}). Using browser microphones…`
-          );
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        if (state === "connected" || state === "completed") {
+          setStatus("Connected — supervisor hearing both mics");
+          setLinked(true);
+        } else if (state === "disconnected") {
+          setStatus("Connection interrupted — trying to reconnect…");
+        } else if (state === "failed") {
+          setStatus("Connection failed. Try again.");
+          setLinked(false);
         }
-      }
+      };
 
-      if (!usedStoreAudio) {
-        lastUsedLocalMixerRef.current = false;
-        cStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            deviceId: { exact: micCustomer },
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            channelCount: 1,
-          },
-          video: false,
-        });
-        sStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            deviceId: { exact: micSales },
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            channelCount: 1,
-          },
-          video: false,
-        });
-        const cTrack = cStream.getAudioTracks()[0];
-        const sTrack = sStream.getAudioTracks()[0];
-        if (!cTrack || !sTrack) {
-          throw new Error("One or both selected microphones are unavailable.");
-        }
-        customerStreamRef.current = cStream;
-        salesStreamRef.current = sStream;
-        startMeters(cStream, sStream);
-        applyMicMutes();
-
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const mixCtx = new AudioCtx();
-        captureMixCtxRef.current = mixCtx;
-        void mixCtx.resume().catch(() => {});
-        const dest = mixCtx.createMediaStreamDestination();
-        const cSrc = mixCtx.createMediaStreamSource(cStream);
-        const sSrc = mixCtx.createMediaStreamSource(sStream);
-        cSrc.connect(dest);
-        sSrc.connect(dest);
-        mixedOutStreamRef.current = dest.stream;
-        const mixedTrack = dest.stream.getAudioTracks()[0];
-        if (mixedTrack) pc.addTrack(mixedTrack, dest.stream);
-      }
+      // 6) Add mixed track and create offer
+      pc.addTrack(mixedTrack, dest.stream);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -407,36 +373,49 @@ export default function FloorStationPanel({
         targetSocketId: supervisor.socketId,
         sdp: offer,
       });
-      if (!usedStoreAudio) {
-        setTimeout(() => {
-          setInputLevels((levels) => {
-            if (levels.customer < 4 || levels.sales < 4) {
-              setStatus(
-                "One selected mic looks inactive. Check mic selection and speak closer to each mic."
-              );
-            }
-            return levels;
-          });
-        }, 1600);
-      }
-      setStatus(
-        usedStoreAudio
-          ? "Offer sent (store audio service) — waiting for supervisor…"
-          : "Offer sent — waiting for supervisor…"
-      );
+
+      setStatus("Offer sent — waiting for supervisor…");
+
+      // 7) After 2 seconds, check if both mics show activity
+      setTimeout(() => {
+        setInputLevels((levels) => {
+          if (levels.customer < 3 && levels.sales < 3) {
+            setStatus(
+              "Both mics look silent. Check headset connections and speak into each mic."
+            );
+          } else if (levels.customer < 3) {
+            setStatus("Customer mic looks silent. Check the customer headset connection.");
+          } else if (levels.sales < 3) {
+            setStatus("Sales mic looks silent. Check the sales headset connection.");
+          }
+          return levels;
+        });
+      }, 2000);
     } catch (e) {
-      setStatus(
-        e?.message
-          ? `Could not start link: ${e.message}`
-          : "Could not access mics or start link."
-      );
+      const msg = e?.message || "Could not access mics or start link.";
+      if (msg.includes("NotAllowedError") || msg.includes("Permission")) {
+        setStatus("Microphone permission denied. Allow mic access and try again.");
+      } else if (msg.includes("NotFoundError") || msg.includes("DevicesNotFound")) {
+        setStatus("Selected microphone not found. Replug the headset and try again.");
+      } else {
+        setStatus(`Error: ${msg}`);
+      }
       teardown();
     } finally {
       setLinking(false);
     }
   };
 
+  const stopLink = () => {
+    teardown();
+    setStatus("Disconnected.");
+  };
+
   useEffect(() => () => teardown(), [teardown]);
+
+  // ─── UI ───
+
+  const sameMicWarning = micCustomer && micSales && micCustomer === micSales;
 
   return (
     <div className="glass rounded-2xl p-5">
@@ -476,7 +455,9 @@ export default function FloorStationPanel({
           </select>
         </div>
         <div>
-          <label className="mb-1 block text-xs text-zinc-500">Play supervisor → customer earpiece</label>
+          <label className="mb-1 block text-xs text-zinc-500">
+            Play supervisor → customer earpiece
+          </label>
           <select
             value={sinkCustomer}
             onChange={(e) => setSinkCustomer(e.target.value)}
@@ -491,7 +472,9 @@ export default function FloorStationPanel({
           </select>
         </div>
         <div>
-          <label className="mb-1 block text-xs text-zinc-500">Play supervisor → sales earpiece</label>
+          <label className="mb-1 block text-xs text-zinc-500">
+            Play supervisor → sales earpiece
+          </label>
           <select
             value={sinkSales}
             onChange={(e) => setSinkSales(e.target.value)}
@@ -507,40 +490,38 @@ export default function FloorStationPanel({
         </div>
       </div>
 
+      {sameMicWarning && (
+        <p className="mt-2 text-xs text-amber-300">
+          Customer and Sales are set to the same microphone. Choose different devices.
+        </p>
+      )}
+
       <div className="mt-4 flex flex-wrap items-center gap-2">
-        <label className="mr-2 inline-flex items-center gap-2 text-xs text-zinc-400">
-          <input
-            type="checkbox"
-            checked={useLocalMixer}
-            onChange={(e) => setUseLocalMixer(e.target.checked)}
-          />
-          Use store audio service
-        </label>
-        {useLocalMixer && (
-          <span
-            className={`text-xs ${
-              localMixerAvailable ? "text-emerald-300" : "text-amber-300"
-            }`}
+        {!linked ? (
+          <button
+            type="button"
+            disabled={linking || !backendConnected || !supervisor || sameMicWarning}
+            onClick={startLink}
+            className="rounded-xl bg-accent-teal/25 px-4 py-2 text-sm font-semibold text-accent-teal disabled:opacity-50"
           >
-            {localMixerBusy
-              ? "Checking store companion..."
-              : localMixerAvailable
-                ? "Companion online — native audio on Start; auto-fallback if it fails"
-                : "Companion offline — browser mixing only"}
+            {linking ? "Connecting…" : "Start audio link to supervisor"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={stopLink}
+            className="rounded-xl bg-red-500/20 px-4 py-2 text-sm font-semibold text-red-400"
+          >
+            Stop link
+          </button>
+        )}
+        {!supervisor && (
+          <span className="text-xs text-amber-300">
+            Waiting for supervisor to sign in…
           </span>
         )}
-        <button
-          type="button"
-          disabled={linking || !backendConnected || !supervisor}
-          onClick={startLink}
-          className="rounded-xl bg-accent-teal/25 px-4 py-2 text-sm font-semibold text-accent-teal disabled:opacity-50"
-        >
-          {linking ? "Connecting…" : "Start audio link to supervisor"}
-        </button>
-        {!supervisor && (
-          <span className="text-xs text-amber-300">Waiting for supervisor to sign in…</span>
-        )}
       </div>
+
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <div>
           <p className="mb-1 text-xs text-zinc-500">Customer mic level</p>
@@ -561,7 +542,20 @@ export default function FloorStationPanel({
           </div>
         </div>
       </div>
-      {status && <p className="mt-3 text-sm text-zinc-400">{status}</p>}
+
+      {status && (
+        <p
+          className={`mt-3 text-sm ${
+            status.includes("Error") || status.includes("failed") || status.includes("denied")
+              ? "text-red-400"
+              : status.includes("Connected") || status.includes("Linked")
+                ? "text-emerald-400"
+                : "text-zinc-400"
+          }`}
+        >
+          {status}
+        </p>
+      )}
 
       <audio ref={outAudioCustomerRef} className="hidden" playsInline />
       <audio ref={outAudioSalesRef} className="hidden" playsInline />

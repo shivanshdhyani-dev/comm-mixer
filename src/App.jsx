@@ -7,7 +7,6 @@ import BottomBar from "./components/BottomBar";
 import AuthPanel from "./components/AuthPanel";
 import FloorStationPanel from "./components/FloorStationPanel";
 import { createMixerSocket } from "./services/socket";
-import useLocalMixer from "./hooks/useLocalMixer";
 import { getIceServers } from "./webrtcConfig";
 
 const initialState = {
@@ -70,10 +69,6 @@ export default function App() {
   const isSupervisor = auth?.role === "supervisor";
   const isFloor = auth?.role === "floor";
   const canRingBell = auth?.role === "supervisor" || auth?.role === "floor";
-  const localMixer = useLocalMixer({
-    connected: mixerState.connected,
-    mode: mixerState.mode,
-  });
 
   useEffect(() => {
     const handleConnect = () => setBackendConnected(true);
@@ -111,9 +106,7 @@ export default function App() {
       const existing = peerConnectionsRef.current.get(fromSocketId);
       if (existing) existing.close();
 
-      const pc = new RTCPeerConnection({
-        iceServers: getIceServers(),
-      });
+      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
       peerConnectionsRef.current.set(fromSocketId, pc);
 
       pc.onicecandidate = (event) => {
@@ -129,7 +122,6 @@ export default function App() {
         if (!stream) return;
         const idx = floorInboundOrderRef.current++;
         if (idx === 0) {
-          // Floor may send a single mixed stream (customer + sales combined).
           setFloorInbound({ customer: stream, sales: stream });
           return;
         }
@@ -137,6 +129,7 @@ export default function App() {
       };
 
       await pc.setRemoteDescription(sdp);
+
       if (!localStreamRef.current) {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({
@@ -155,6 +148,7 @@ export default function App() {
           return;
         }
       }
+
       const track = localStreamRef.current.getAudioTracks()[0];
       if (track) pc.addTrack(track, localStreamRef.current);
       const answer = await pc.createAnswer();
@@ -245,7 +239,7 @@ export default function App() {
       if (authRef.current?.role === "supervisor") {
         socket.emit("media:micState", { micOn: true });
       }
-    } catch (error) {
+    } catch {
       setMediaError("Microphone permission denied or unavailable.");
       if (authRef.current?.role === "supervisor") {
         socket.emit("media:micState", { micOn: false });
@@ -270,6 +264,7 @@ export default function App() {
     }
   }, [mixerState.participants, auth?.role]);
 
+  // Play floor audio on supervisor side
   const vol = mixerState.connected ? 1 : 0;
   useEffect(() => {
     if (auth?.role !== "supervisor") return;
@@ -342,21 +337,17 @@ export default function App() {
   const isTalkToSales =
     mixerState.mode === "talk-sales" || mixerState.mode === "talk-both";
 
-  const useLiveLevels = isSupervisor && localMixer.running;
   const speaking = {
     customer:
       Boolean(mixerState.participants.find((p) => p.id === "customer")?.micOn) &&
-      mixerState.connected &&
-      (useLiveLevels ? localMixer.levels.customer > 6 : true),
+      mixerState.connected,
     sales:
       Boolean(mixerState.participants.find((p) => p.id === "sales")?.micOn) &&
-      mixerState.connected &&
-      (useLiveLevels ? localMixer.levels.sales > 6 : true),
+      mixerState.connected,
     supervisor:
       Boolean(mixerState.participants.find((p) => p.id === "supervisor")?.micOn) &&
       mixerState.connected &&
-      mixerState.mode !== "listen" &&
-      (useLiveLevels ? localMixer.levels.supervisor > 6 : true),
+      mixerState.mode !== "listen",
   };
 
   const routes = {
@@ -370,12 +361,6 @@ export default function App() {
   };
 
   const simulateLevels = () => {
-    if (localMixer.running) {
-      return {
-        l: localMixer.levels.monitorL,
-        r: localMixer.levels.monitorR,
-      };
-    }
     const t = Date.now() / 420;
     return {
       l: mixerState.connected
@@ -440,16 +425,6 @@ export default function App() {
           liveLevels={simulateLevels}
           connected={mixerState.connected && backendConnected}
           canManage={isSupervisor}
-          inputDevices={isSupervisor ? localMixer.inputDevices : []}
-          selectedInputs={isSupervisor ? localMixer.selectedInputs : {}}
-          onSelectInput={(role, deviceId) =>
-            isSupervisor &&
-            localMixer.setSelectedInputs((prev) => ({ ...prev, [role]: deviceId }))
-          }
-          onStartMixer={isSupervisor ? localMixer.start : () => {}}
-          onStopMixer={isSupervisor ? localMixer.stop : () => {}}
-          mixerRunning={isSupervisor && localMixer.running}
-          mixerError={isSupervisor ? localMixer.error : ""}
           floorHint={isFloor}
         />
       </main>
