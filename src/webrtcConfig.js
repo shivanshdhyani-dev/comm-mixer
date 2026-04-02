@@ -1,6 +1,11 @@
 /**
- * ICE servers for WebRTC. For live / cross-network tests, set VITE_WEBRTC_ICE_SERVERS
- * to a JSON array, e.g. [{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:...","username":"...","credential":"..."}]
+ * ICE servers for WebRTC.
+ *
+ * Override with VITE_WEBRTC_ICE_SERVERS env var (JSON array), e.g.:
+ *   [{"urls":"turn:your.server:3478","username":"user","credential":"pass"}]
+ *
+ * Default includes STUN + free TURN relays so cross-network calls work
+ * without any extra setup.
  */
 export function getIceServers() {
   const raw = import.meta.env.VITE_WEBRTC_ICE_SERVERS;
@@ -12,5 +17,29 @@ export function getIceServers() {
       /* fall through */
     }
   }
-  return [{ urls: "stun:stun.l.google.com:19302" }];
+
+  return [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: "turn:freeturn.net:3478",
+      username: "free",
+      credential: "free",
+    },
+    {
+      urls: "turn:freeturn.net:5349",
+      username: "free",
+      credential: "free",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+  ];
 }

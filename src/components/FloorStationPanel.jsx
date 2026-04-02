@@ -42,7 +42,16 @@ export default function FloorStationPanel({
 
   const refreshDevices = useCallback(async () => {
     const list = await navigator.mediaDevices.enumerateDevices();
-    setInputs(list.filter((d) => d.kind === "audioinput"));
+    // Filter out "default" and "communications" virtual devices — they alias real
+    // hardware and cause both dropdowns to capture the same physical mic.
+    setInputs(
+      list.filter(
+        (d) =>
+          d.kind === "audioinput" &&
+          d.deviceId !== "default" &&
+          d.deviceId !== "communications"
+      )
+    );
     setOutputs(list.filter((d) => d.kind === "audiooutput"));
   }, []);
 
@@ -416,6 +425,15 @@ export default function FloorStationPanel({
   // ─── UI ───
 
   const sameMicWarning = micCustomer && micSales && micCustomer === micSales;
+  const sameHardwareWarning =
+    !sameMicWarning &&
+    micCustomer &&
+    micSales &&
+    (() => {
+      const c = inputs.find((d) => d.deviceId === micCustomer);
+      const s = inputs.find((d) => d.deviceId === micSales);
+      return c && s && c.groupId && c.groupId === s.groupId;
+    })();
 
   return (
     <div className="glass rounded-2xl p-5">
@@ -493,6 +511,11 @@ export default function FloorStationPanel({
       {sameMicWarning && (
         <p className="mt-2 text-xs text-amber-300">
           Customer and Sales are set to the same microphone. Choose different devices.
+        </p>
+      )}
+      {sameHardwareWarning && (
+        <p className="mt-2 text-xs text-amber-300">
+          These two entries appear to be the same physical device. Pick two separate headsets.
         </p>
       )}
 
