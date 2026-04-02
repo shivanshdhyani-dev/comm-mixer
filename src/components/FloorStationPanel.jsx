@@ -26,7 +26,8 @@ export default function FloorStationPanel({
   const [status, setStatus] = useState("");
   const [linking, setLinking] = useState(false);
   const [inputLevels, setInputLevels] = useState({ customer: 0, sales: 0 });
-  const [useLocalMixer, setUseLocalMixer] = useState(true);
+  /** Off by default: live sites rarely have local-mixer running; avoids /health spam in console. */
+  const [useLocalMixer, setUseLocalMixer] = useState(false);
   const [localMixerAvailable, setLocalMixerAvailable] = useState(false);
   const [localMixerBusy, setLocalMixerBusy] = useState(false);
 
@@ -87,11 +88,12 @@ export default function FloorStationPanel({
   useEffect(() => {
     if (!useLocalMixer) return;
     refreshLocalMixerHealth().catch(() => {});
+    const ms = localMixerAvailable ? 8000 : 25000;
     const id = window.setInterval(() => {
       refreshLocalMixerHealth().catch(() => {});
-    }, 5000);
+    }, ms);
     return () => window.clearInterval(id);
-  }, [refreshLocalMixerHealth, useLocalMixer]);
+  }, [refreshLocalMixerHealth, useLocalMixer, localMixerAvailable]);
 
   const teardownPlaybackOnly = useCallback(() => {
     supervisorStreamRef.current = null;
