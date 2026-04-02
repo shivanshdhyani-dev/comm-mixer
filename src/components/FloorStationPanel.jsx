@@ -299,16 +299,65 @@ export default function FloorStationPanel({
     teardown();
 
     try {
-      const shouldUseLocalMixer = useLocalMixer && localMixerAvailable;
+      const tryStoreAudioFirst = useLocalMixer && localMixerAvailable;
       let cStream = null;
       let sStream = null;
-      lastUsedLocalMixerRef.current = shouldUseLocalMixer;
+      let usedStoreAudio = false;
+      lastUsedLocalMixerRef.current = false;
 
-      if (!shouldUseLocalMixer) {
+      const pc = new RTCPeerConnection({
+        iceServers: getIceServers(),
+      });
+      pcRef.current = pc;
+
+      pc.onicecandidate = (e) => {
+        if (!e.candidate || !supervisor) return;
+        socket.emit("webrtc:ice", {
+          targetSocketId: supervisor.socketId,
+          candidate: e.candidate,
+        });
+      };
+
+      pc.ontrack = (ev) => {
+        const [stream] = ev.streams;
+        if (stream?.getAudioTracks().length) {
+          buildTalkbackGraph(stream);
+        }
+      };
+
+      if (tryStoreAudioFirst) {
+        try {
+          const customerName = getInputLabelById(micCustomer);
+          const salesName = getInputLabelById(micSales);
+          await startLocalMixerCapture({
+            mic1: customerName || micCustomer,
+            mic2: salesName || micSales,
+          });
+          const bridge = openLocalMixerStream();
+          const track = bridge.stream.getAudioTracks()[0];
+          if (!track) {
+            bridge.close();
+            throw new Error("no track from store service");
+          }
+          localMixerBridgeRef.current = bridge;
+          mixedOutStreamRef.current = bridge.stream;
+          pc.addTrack(track, bridge.stream);
+          usedStoreAudio = true;
+          lastUsedLocalMixerRef.current = true;
+          setInputLevels({ customer: 0, sales: 0 });
+        } catch (err) {
+          const msg = err?.message || "store audio failed";
+          setStatus(
+            `Store audio service unavailable (${msg}). Using browser microphones…`
+          );
+        }
+      }
+
+      if (!usedStoreAudio) {
+        lastUsedLocalMixerRef.current = false;
         cStream = await navigator.mediaDevices.getUserMedia({
           audio: {
             deviceId: { exact: micCustomer },
-            // Disable voice-processing to reduce single-mic takeover behavior.
             echoCancellation: false,
             noiseSuppression: false,
             autoGainControl: false,
@@ -335,45 +384,7 @@ export default function FloorStationPanel({
         salesStreamRef.current = sStream;
         startMeters(cStream, sStream);
         applyMicMutes();
-      } else {
-        setInputLevels({ customer: 0, sales: 0 });
-      }
 
-      const pc = new RTCPeerConnection({
-        iceServers: getIceServers(),
-      });
-      pcRef.current = pc;
-
-      pc.onicecandidate = (e) => {
-        if (!e.candidate || !supervisor) return;
-        socket.emit("webrtc:ice", {
-          targetSocketId: supervisor.socketId,
-          candidate: e.candidate,
-        });
-      };
-
-      pc.ontrack = (ev) => {
-        const [stream] = ev.streams;
-        if (stream?.getAudioTracks().length) {
-          buildTalkbackGraph(stream);
-        }
-      };
-
-      if (shouldUseLocalMixer) {
-        const customerName = getInputLabelById(micCustomer);
-        const salesName = getInputLabelById(micSales);
-        await startLocalMixerCapture({
-          mic1: customerName || micCustomer,
-          mic2: salesName || micSales,
-        });
-        const bridge = openLocalMixerStream();
-        localMixerBridgeRef.current = bridge;
-        mixedOutStreamRef.current = bridge.stream;
-        const track = bridge.stream.getAudioTracks()[0];
-        if (track) pc.addTrack(track, bridge.stream);
-      } else {
-        // Mix both headset mics into one outgoing channel to avoid multi-track
-        // device capture inconsistencies on single-laptop store setups.
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         const mixCtx = new AudioCtx();
         captureMixCtxRef.current = mixCtx;
@@ -394,7 +405,7 @@ export default function FloorStationPanel({
         targetSocketId: supervisor.socketId,
         sdp: offer,
       });
-      if (!shouldUseLocalMixer) {
+      if (!usedStoreAudio) {
         setTimeout(() => {
           setInputLevels((levels) => {
             if (levels.customer < 4 || levels.sales < 4) {
@@ -407,7 +418,7 @@ export default function FloorStationPanel({
         }, 1600);
       }
       setStatus(
-        shouldUseLocalMixer
+        usedStoreAudio
           ? "Offer sent (store audio service) — waiting for supervisor…"
           : "Offer sent — waiting for supervisor…"
       );
@@ -510,10 +521,10 @@ export default function FloorStationPanel({
             }`}
           >
             {localMixerBusy
-              ? "Checking store audio service..."
+              ? "Checking store companion..."
               : localMixerAvailable
-                ? "Store audio service reachable"
-                : "Service offline: browser fallback will be used"}
+                ? "Companion online — native audio on Start; auto-fallback if it fails"
+                : "Companion offline — browser mixing only"}
           </span>
         )}
         <button

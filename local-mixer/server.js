@@ -134,12 +134,10 @@ async function startCapture(mic1, mic2) {
   current = { active: true, mic1, mic2 };
 }
 
-app.get("/health", async (_req, res) => {
-  try {
-    await ensureAudioModule();
-  } catch {
-    // keep health endpoint non-fatal; include error in payload
-  }
+// Do NOT load naudiodon here. On some macOS/Node builds `import("naudiodon")` aborts the
+// whole process (dyld: missing symbol called). Loading only on /devices and /start keeps
+// this process alive so the browser still gets HTTP 200 and can fall back to Web Audio.
+app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     ...current,
