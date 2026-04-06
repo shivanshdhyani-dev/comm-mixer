@@ -63,6 +63,7 @@ export default function App() {
   const peerConnectionsRef = useRef(new Map());
   const audioFloorCustomerRef = useRef(null);
   const audioFloorSalesRef = useRef(null);
+  const floorInboundOrderRef = useRef(0);
   const loginTimeoutRef = useRef(null);
   const authRef = useRef(null);
   authRef.current = auth;
@@ -101,21 +102,15 @@ export default function App() {
       cleanupPeers();
     };
 
-    const handleOffer = async ({ fromSocketId, fromRole, sdp, channel }) => {
+    const handleOffer = async ({ fromSocketId, fromRole, sdp }) => {
       if (!sdp || authRef.current?.role !== "supervisor" || fromRole !== "floor") return;
-      const ch = channel || "customer";
-      const pcKey = `${fromSocketId}:${ch}`;
 
       try {
-        // Only reset state on the first channel offer from a new floor connection
-        if (ch === "customer") {
-          setFloorInbound((prev) => ({ ...prev, customer: null }));
-        } else {
-          setFloorInbound((prev) => ({ ...prev, sales: null }));
-        }
+        floorInboundOrderRef.current = 0;
+        setFloorInbound({ customer: null, sales: null });
         setFloorConnectionState("connecting");
 
-        const existing = peerConnectionsRef.current.get(pcKey);
+        const existing = peerConnectionsRef.current.get(fromSocketId);
         if (existing) existing.close();
 
         const pc = new RTCPeerConnection({
@@ -123,11 +118,11 @@ export default function App() {
           bundlePolicy: "max-bundle",
           iceTransportPolicy: "relay",
         });
-        peerConnectionsRef.current.set(pcKey, pc);
+        peerConnectionsRef.current.set(fromSocketId, pc);
 
         pc.oniceconnectionstatechange = () => {
           const state = pc.iceConnectionState;
-          console.log(`[Supervisor] ICE ${ch}: ${state}`);
+          console.log("[Supervisor] ICE connection state:", state);
           setFloorConnectionState(state);
         };
 
@@ -136,7 +131,6 @@ export default function App() {
           socket.emit("webrtc:ice", {
             targetSocketId: fromSocketId,
             candidate: event.candidate,
-            channel: ch,
           });
         };
 
@@ -144,14 +138,19 @@ export default function App() {
           const track = event.track;
           if (track.kind !== "audio") return;
           const stream = new MediaStream([track]);
-          console.log(`[Supervisor] ontrack (${ch}): enabled=${track.enabled} readyState=${track.readyState}`);
-          setFloorInbound((prev) => ({ ...prev, [ch]: stream }));
+          const idx = floorInboundOrderRef.current++;
+          const label = idx === 0 ? "customer" : "sales";
+          console.log(`[Supervisor] ontrack #${idx} (${label}): enabled=${track.enabled} readyState=${track.readyState}`);
+          if (idx === 0) {
+            setFloorInbound((prev) => ({ ...prev, customer: stream }));
+          } else {
+            setFloorInbound((prev) => ({ ...prev, sales: stream }));
+          }
         };
 
         await pc.setRemoteDescription(sdp);
 
-        // Acquire supervisor mic — use a shared promise so concurrent
-        // offer handlers don't race on getUserMedia.
+        // Acquire supervisor mic via shared promise
         if (!localStreamPromiseRef.current) {
           localStreamPromiseRef.current = navigator.mediaDevices.getUserMedia({
             audio: {
@@ -173,58 +172,51 @@ export default function App() {
         }
         await localStreamPromiseRef.current;
 
-        // Add supervisor mic to this PC for talk-back.
-        // Clone the track so each PC has its own independent copy —
-        // Chrome can fail to encode the same track on two senders.
+        // Send supervisor mic on the FIRST audio transceiver only.
+        // The floor receives one talkback track and routes it to the
+        // correct headset(s) via dynamic setSinkId switching.
         if (localStreamRef.current) {
-          const srcTrack = localStreamRef.current.getAudioTracks()[0];
-          if (srcTrack) {
-            const track = srcTrack.clone();
+          const track = localStreamRef.current.getAudioTracks()[0];
+          if (track) {
             const transceivers = pc.getTransceivers().filter(
               (t) => t.receiver?.track?.kind === "audio" && !t.stopped
             );
             if (transceivers.length > 0) {
               transceivers[0].direction = "sendrecv";
               await transceivers[0].sender.replaceTrack(track);
-            } else {
-              pc.addTrack(track);
+              console.log("[Supervisor] Mic on transceiver 0 for talk-back");
             }
-            console.log(`[Supervisor] Added mic clone to ${ch} PC for talk-back`);
           }
         }
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer, channel: ch });
-        console.log(`[Supervisor] Answer sent to floor (${ch})`);
+        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
+        console.log("[Supervisor] Answer sent to floor");
       } catch (err) {
-        console.error(`[Supervisor] handleOffer (${ch}) failed:`, err);
+        console.error("[Supervisor] handleOffer failed:", err);
         setMediaError("Failed to establish connection with floor: " + err.message);
         setFloorConnectionState("failed");
       }
     };
 
-    const handleIce = async ({ fromSocketId, candidate, channel }) => {
+    const handleIce = async ({ fromSocketId, candidate }) => {
       if (!candidate) return;
-      const ch = channel || "customer";
-      const pc = peerConnectionsRef.current.get(`${fromSocketId}:${ch}`);
+      const pc = peerConnectionsRef.current.get(fromSocketId);
       if (!pc) return;
       try {
         await pc.addIceCandidate(candidate);
       } catch (err) {
-        console.warn(`[Supervisor] Failed to add ICE candidate (${ch}):`, err.message);
+        console.warn("[Supervisor] Failed to add ICE candidate:", err.message);
       }
     };
 
     const handlePeerLeft = ({ socketId, role }) => {
       if (role !== "floor") return;
-      for (const ch of ["customer", "sales"]) {
-        const pcKey = `${socketId}:${ch}`;
-        const pc = peerConnectionsRef.current.get(pcKey);
-        if (pc) {
-          pc.close();
-          peerConnectionsRef.current.delete(pcKey);
-        }
+      const pc = peerConnectionsRef.current.get(socketId);
+      if (pc) {
+        pc.close();
+        peerConnectionsRef.current.delete(socketId);
       }
       setFloorInbound({ customer: null, sales: null });
     };

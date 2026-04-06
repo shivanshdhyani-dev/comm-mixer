@@ -3,10 +3,17 @@ import { getIceServers } from "../webrtcConfig";
 
 /**
  * Store laptop: two headset mics (customer + sales) → supervisor.
- * Uses TWO separate RTCPeerConnections (one per channel) so each
- * supervisor talk-back track plays on its own <audio> element.
- * Chrome only allows one WebRTC remote track per audio element,
- * so a single PC with two tracks cannot route to two headsets.
+ *
+ * Supervisor talk-back uses a SINGLE <audio> element for the WebRTC track
+ * (Chrome only allows one element to play WebRTC remote audio).  The element's
+ * setSinkId is switched dynamically based on mode:
+ *   - talk-customer → customer headset
+ *   - talk-sales   → sales headset
+ *   - talk-both    → customer headset + captureStream() → second element → sales headset
+ *   - listen       → volume 0
+ *
+ * captureStream() produces a LOCAL MediaStream (not WebRTC), so Chrome allows
+ * the second element to play it independently.
  */
 export default function FloorStationPanel({
   socket,
@@ -26,16 +33,23 @@ export default function FloorStationPanel({
   const [inputLevels, setInputLevels] = useState({ customer: 0, sales: 0 });
   const [testing, setTesting] = useState("");
 
-  const pcCustomerRef = useRef(null);
-  const pcSalesRef = useRef(null);
+  const pcRef = useRef(null);
   const customerStreamRef = useRef(null);
   const salesStreamRef = useRef(null);
   const meterRafRef = useRef(null);
   const meterCtxRef = useRef(null);
-  const outAudioCustomerRef = useRef(null);
-  const outAudioSalesRef = useRef(null);
-  const pendingCandidatesRef = useRef({ customer: [], sales: [] });
+  // Primary element — plays the WebRTC remote track directly
+  const outAudioPrimaryRef = useRef(null);
+  // Secondary element — plays captureStream() output (local, not WebRTC)
+  const outAudioSecondaryRef = useRef(null);
+  const pendingCandidatesRef = useRef([]);
   const permissionGrantedRef = useRef(false);
+  const modeRef = useRef(mixerState.mode);
+  modeRef.current = mixerState.mode;
+  const sinkCustomerRef = useRef(sinkCustomer);
+  sinkCustomerRef.current = sinkCustomer;
+  const sinkSalesRef = useRef(sinkSales);
+  sinkSalesRef.current = sinkSales;
 
   const supervisor = presence.find((p) => p.role === "supervisor");
 
@@ -48,10 +62,9 @@ export default function FloorStationPanel({
         tmp.getTracks().forEach((t) => t.stop());
         permissionGrantedRef.current = true;
       } catch {
-        /* permission denied — carry on with what we can get */
+        /* permission denied — carry on */
       }
     }
-
     const list = await navigator.mediaDevices.enumerateDevices();
     setInputs(
       list.filter(
@@ -79,21 +92,10 @@ export default function FloorStationPanel({
 
   // ─── Teardown helpers ───
 
-  const teardownPlayback = useCallback(() => {
-    const elC = outAudioCustomerRef.current;
-    const elS = outAudioSalesRef.current;
-    if (elC) elC.srcObject = null;
-    if (elS) elS.srcObject = null;
-  }, []);
-
   const teardown = useCallback(() => {
-    if (pcCustomerRef.current) {
-      pcCustomerRef.current.close();
-      pcCustomerRef.current = null;
-    }
-    if (pcSalesRef.current) {
-      pcSalesRef.current.close();
-      pcSalesRef.current = null;
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
     }
     customerStreamRef.current?.getTracks?.().forEach((t) => t.stop());
     salesStreamRef.current?.getTracks?.().forEach((t) => t.stop());
@@ -107,10 +109,13 @@ export default function FloorStationPanel({
       meterCtxRef.current.close();
       meterCtxRef.current = null;
     }
+    const elP = outAudioPrimaryRef.current;
+    const elS = outAudioSecondaryRef.current;
+    if (elP) { elP.srcObject = null; elP.volume = 0; }
+    if (elS) { elS.srcObject = null; elS.volume = 0; }
     setInputLevels({ customer: 0, sales: 0 });
     setLinked(false);
-    teardownPlayback();
-  }, [teardownPlayback]);
+  }, []);
 
   // ─── Level meters ───
 
@@ -153,28 +158,63 @@ export default function FloorStationPanel({
     meterRafRef.current = requestAnimationFrame(tick);
   }, []);
 
-  // ─── Supervisor talk-back volume (mode-based) ───
+  // ─── Apply talkback routing based on mode ───
 
-  const modeRef = useRef(mixerState.mode);
-  modeRef.current = mixerState.mode;
+  const applyTalkbackRouting = useCallback((mode) => {
+    const elP = outAudioPrimaryRef.current;
+    const elS = outAudioSecondaryRef.current;
+    if (!elP?.srcObject) return;
+
+    const sc = sinkCustomerRef.current;
+    const ss = sinkSalesRef.current;
+
+    if (mode === "talk-customer") {
+      elP.volume = 1;
+      if (sc && elP.setSinkId) elP.setSinkId(sc).catch(() => {});
+      if (elS) elS.volume = 0;
+      console.log("[Floor] Talkback → customer headset");
+    } else if (mode === "talk-sales") {
+      // Route the SAME primary element to the sales headset
+      elP.volume = 1;
+      if (ss && elP.setSinkId) elP.setSinkId(ss).catch(() => {});
+      if (elS) elS.volume = 0;
+      console.log("[Floor] Talkback → sales headset (switched setSinkId)");
+    } else if (mode === "talk-both") {
+      // Primary → customer headset
+      elP.volume = 1;
+      if (sc && elP.setSinkId) elP.setSinkId(sc).catch(() => {});
+      // Secondary → sales headset via captureStream (local stream, not WebRTC)
+      if (elS) {
+        if (!elS.srcObject) {
+          try {
+            const captured = elP.captureStream();
+            elS.srcObject = captured;
+            console.log("[Floor] captureStream created for talk-both secondary");
+          } catch (e) {
+            console.warn("[Floor] captureStream failed:", e.message);
+          }
+        }
+        if (ss && elS.setSinkId) elS.setSinkId(ss).catch(() => {});
+        elS.volume = 1;
+        elS.play().catch(() => {});
+      }
+      console.log("[Floor] Talkback → BOTH headsets");
+    } else {
+      // "listen" or any other mode
+      elP.volume = 0;
+      if (elS) elS.volume = 0;
+      console.log("[Floor] Talkback muted (listen mode)");
+    }
+  }, []);
 
   useEffect(() => {
-    const mode = mixerState.mode;
-    const cVal = mode === "talk-customer" || mode === "talk-both" ? 1 : 0;
-    const sVal = mode === "talk-sales" || mode === "talk-both" ? 1 : 0;
-    const elC = outAudioCustomerRef.current;
-    const elS = outAudioSalesRef.current;
-    if (elC?.srcObject) elC.volume = cVal;
-    if (elS?.srcObject) elS.volume = sVal;
-    console.log(`[Floor] Talkback volume: mode="${mode}" customer=${cVal} sales=${sVal}`);
-  }, [mixerState.mode]);
+    applyTalkbackRouting(mixerState.mode);
+  }, [mixerState.mode, applyTalkbackRouting]);
 
+  // Re-apply sink when user changes output device dropdowns
   useEffect(() => {
-    const elC = outAudioCustomerRef.current;
-    const elS = outAudioSalesRef.current;
-    if (elC && sinkCustomer && elC.setSinkId) elC.setSinkId(sinkCustomer).catch(() => {});
-    if (elS && sinkSales && elS.setSinkId) elS.setSinkId(sinkSales).catch(() => {});
-  }, [sinkCustomer, sinkSales]);
+    applyTalkbackRouting(modeRef.current);
+  }, [sinkCustomer, sinkSales, applyTalkbackRouting]);
 
   // ─── Mic mute sync ───
 
@@ -251,53 +291,43 @@ export default function FloorStationPanel({
     }
   }, [testing, linked, refreshDevices]);
 
-  // ─── WebRTC answer / ICE from supervisor (channel-aware) ───
+  // ─── WebRTC answer / ICE from supervisor ───
 
   useEffect(() => {
-    const onAnswer = async ({ fromSocketId, sdp, channel }) => {
+    const onAnswer = async ({ fromSocketId, sdp }) => {
       if (!supervisor || fromSocketId !== supervisor.socketId) return;
-      const ch = channel || "customer";
-      const pc = ch === "sales" ? pcSalesRef.current : pcCustomerRef.current;
+      const pc = pcRef.current;
       if (!pc || !sdp) return;
       try {
         await pc.setRemoteDescription(sdp);
-        console.log(`[Floor] Remote description set for ${ch}, flushing buffered candidates`);
-        const buffered = pendingCandidatesRef.current[ch] || [];
-        for (const c of buffered) {
+        console.log("[Floor] Remote description set, flushing", pendingCandidatesRef.current.length, "buffered candidates");
+        for (const c of pendingCandidatesRef.current) {
           try {
             await pc.addIceCandidate(c);
           } catch (err) {
-            console.warn(`[Floor] Failed to add buffered ICE candidate (${ch}):`, err.message);
+            console.warn("[Floor] Failed to add buffered ICE candidate:", err.message);
           }
         }
-        pendingCandidatesRef.current[ch] = [];
-        // Mark linked once both PCs have remote descriptions
-        const otherPc = ch === "sales" ? pcCustomerRef.current : pcSalesRef.current;
-        if (otherPc?.remoteDescription) {
-          setStatus("Linked with supervisor — both mics streaming");
-          setLinked(true);
-        } else {
-          setStatus(`${ch} channel linked, waiting for other…`);
-        }
-      } catch (e) {
-        setStatus(`Failed to apply answer from supervisor (${ch})`);
+        pendingCandidatesRef.current = [];
+        setStatus("Linked with supervisor — both mics streaming");
+        setLinked(true);
+      } catch {
+        setStatus("Failed to apply answer from supervisor");
       }
     };
 
-    const onIce = async ({ fromSocketId, candidate, channel }) => {
+    const onIce = async ({ fromSocketId, candidate }) => {
       if (!supervisor || fromSocketId !== supervisor.socketId || !candidate) return;
-      const ch = channel || "customer";
-      const pc = ch === "sales" ? pcSalesRef.current : pcCustomerRef.current;
+      const pc = pcRef.current;
       if (!pc) return;
       if (!pc.remoteDescription) {
-        pendingCandidatesRef.current[ch] = pendingCandidatesRef.current[ch] || [];
-        pendingCandidatesRef.current[ch].push(candidate);
+        pendingCandidatesRef.current.push(candidate);
         return;
       }
       try {
         await pc.addIceCandidate(candidate);
       } catch (err) {
-        console.warn(`[Floor] Failed to add ICE candidate (${ch}):`, err.message);
+        console.warn("[Floor] Failed to add ICE candidate:", err.message);
       }
     };
 
@@ -309,7 +339,7 @@ export default function FloorStationPanel({
     };
   }, [socket, supervisor]);
 
-  // ─── Core: start link (two PCs — one per channel) ───
+  // ─── Core: start link ───
 
   const startLink = async () => {
     if (!supervisor) {
@@ -327,7 +357,7 @@ export default function FloorStationPanel({
 
     setLinking(true);
     setStatus("Requesting microphone access…");
-    pendingCandidatesRef.current = { customer: [], sales: [] };
+    pendingCandidatesRef.current = [];
     teardown();
 
     try {
@@ -369,86 +399,67 @@ export default function FloorStationPanel({
       startMeters(cStream, sStream);
       applyMicMutes();
 
-      setStatus("Setting up WebRTC (two channels)…");
-
-      const rtcConfig = {
+      setStatus("Setting up WebRTC…");
+      const pc = new RTCPeerConnection({
         iceServers: getIceServers(),
         bundlePolicy: "max-bundle",
         iceTransportPolicy: "relay",
+      });
+      pcRef.current = pc;
+
+      pc.onicecandidate = (e) => {
+        if (!e.candidate || !supervisor) return;
+        socket.emit("webrtc:ice", {
+          targetSocketId: supervisor.socketId,
+          candidate: e.candidate,
+        });
       };
 
-      // Helper: create one RTCPeerConnection for a single channel
-      const createChannelPC = (track, stream, channel, audioElRef, sinkId) => {
-        const pc = new RTCPeerConnection(rtcConfig);
-
-        pc.onicecandidate = (e) => {
-          if (!e.candidate || !supervisor) return;
-          socket.emit("webrtc:ice", {
-            targetSocketId: supervisor.socketId,
-            candidate: e.candidate,
-            channel,
-          });
-        };
-
-        pc.ontrack = (ev) => {
-          if (ev.track.kind !== "audio") return;
-          const el = audioElRef.current;
-          if (!el) return;
-          el.srcObject = new MediaStream([ev.track]);
-          el.volume = 1;
-          if (sinkId && el.setSinkId) el.setSinkId(sinkId).catch(() => {});
-          el.play().then(() => {
-            const mode = modeRef.current;
-            const isActive = channel === "customer"
-              ? (mode === "talk-customer" || mode === "talk-both")
-              : (mode === "talk-sales" || mode === "talk-both");
-            el.volume = isActive ? 1 : 0;
-            console.log(`[Floor] Talkback → ${channel} headset (audio element, vol=${el.volume})`);
-          }).catch((err) => console.warn(`[Floor] ${channel} talkback play failed:`, err.message));
-        };
-
-        pc.oniceconnectionstatechange = () => {
-          const state = pc.iceConnectionState;
-          console.log(`[Floor] ICE ${channel}: ${state}`);
-          if (state === "connected" || state === "completed") {
-            setLinked(true);
-            setStatus("Connected — supervisor hearing both mics");
-          } else if (state === "checking") {
-            setStatus(`Connecting ${channel} channel…`);
-          } else if (state === "disconnected") {
-            setStatus(`${channel} channel interrupted — reconnecting…`);
-          } else if (state === "failed") {
-            setStatus(`${channel} channel failed — TURN relay may be down. Try again.`);
-          }
-        };
-
-        pc.addTrack(track, stream);
-        return pc;
+      // Supervisor talk-back: only ONE remote audio track expected.
+      // Play it on the primary element; mode effect handles setSinkId routing.
+      let talkbackReceived = false;
+      pc.ontrack = (ev) => {
+        if (ev.track.kind !== "audio" || talkbackReceived) return;
+        talkbackReceived = true;
+        const el = outAudioPrimaryRef.current;
+        if (!el) return;
+        el.srcObject = new MediaStream([ev.track]);
+        el.volume = 0; // start muted; mode effect will set volume + sink
+        el.play().then(() => {
+          console.log("[Floor] Talkback track playing on primary element");
+          // Apply current mode routing
+          applyTalkbackRouting(modeRef.current);
+        }).catch((e) => console.warn("[Floor] Talkback play failed:", e.message));
       };
 
-      const pcC = createChannelPC(cTrack, cStream, "customer", outAudioCustomerRef, sinkCustomer);
-      const pcS = createChannelPC(sTrack, sStream, "sales", outAudioSalesRef, sinkSales);
-      pcCustomerRef.current = pcC;
-      pcSalesRef.current = pcS;
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        console.log("[Floor] ICE connection state:", state);
+        if (state === "connected" || state === "completed") {
+          setStatus("Connected — supervisor hearing both mics");
+          setLinked(true);
+        } else if (state === "checking") {
+          setStatus("Connecting to supervisor…");
+        } else if (state === "disconnected") {
+          setStatus("Connection interrupted — trying to reconnect…");
+        } else if (state === "failed") {
+          setStatus("Connection failed — TURN relay may be down. Try again.");
+          setLinked(false);
+        }
+      };
 
-      // Send offers for both channels
-      const offerC = await pcC.createOffer();
-      await pcC.setLocalDescription(offerC);
+      // Send both mic tracks (customer first, then sales)
+      pc.addTrack(cTrack, cStream);
+      pc.addTrack(sTrack, sStream);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
       socket.emit("webrtc:offer", {
         targetSocketId: supervisor.socketId,
-        sdp: offerC,
-        channel: "customer",
+        sdp: offer,
       });
 
-      const offerS = await pcS.createOffer();
-      await pcS.setLocalDescription(offerS);
-      socket.emit("webrtc:offer", {
-        targetSocketId: supervisor.socketId,
-        sdp: offerS,
-        channel: "sales",
-      });
-
-      setStatus("Offers sent — waiting for supervisor…");
+      setStatus("Offer sent — waiting for supervisor…");
 
       const customerLabel = cTrack.label || "Customer mic";
       const salesLabel = sTrack.label || "Sales mic";
@@ -666,8 +677,10 @@ export default function FloorStationPanel({
         </p>
       )}
 
-      <audio ref={outAudioCustomerRef} className="hidden" playsInline />
-      <audio ref={outAudioSalesRef} className="hidden" playsInline />
+      {/* Primary: plays the WebRTC talkback track */}
+      <audio ref={outAudioPrimaryRef} className="hidden" playsInline />
+      {/* Secondary: plays captureStream() output for talk-both mode */}
+      <audio ref={outAudioSecondaryRef} className="hidden" playsInline />
     </div>
   );
 }
