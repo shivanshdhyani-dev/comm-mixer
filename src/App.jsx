@@ -138,7 +138,9 @@ export default function App() {
           const [stream] = event.streams;
           if (!stream) return;
           const idx = floorInboundOrderRef.current++;
-          // Floor sends customer track first (idx 0), then sales (idx 1)
+          const label = idx === 0 ? "customer" : "sales";
+          const track = event.track;
+          console.log(`[Supervisor] ontrack #${idx} (${label}): kind=${track.kind} enabled=${track.enabled} muted=${track.muted} readyState=${track.readyState}`);
           if (idx === 0) {
             setFloorInbound((prev) => ({ ...prev, customer: stream }));
           } else {
@@ -305,11 +307,15 @@ export default function App() {
     if (auth?.role !== "supervisor") return;
     const c = audioFloorCustomerRef.current;
     const s = audioFloorSalesRef.current;
-    const tryPlay = (el) => {
+    const tryPlay = (el, label) => {
       if (!el) return;
       el.play()
-        .then(() => setAutoplayBlocked(false))
-        .catch(() => {
+        .then(() => {
+          console.log(`[Supervisor] Audio playing: ${label}, volume=${el.volume}, muted=${el.muted}`);
+          setAutoplayBlocked(false);
+        })
+        .catch((err) => {
+          console.warn(`[Supervisor] Autoplay blocked for ${label}:`, err.message);
           setAutoplayBlocked(true);
           const once = () => {
             el.play()
@@ -323,14 +329,16 @@ export default function App() {
         });
     };
     if (c && floorInbound.customer) {
+      console.log("[Supervisor] Setting customer audio stream, vol=", vol);
       c.srcObject = floorInbound.customer;
       c.volume = vol;
-      tryPlay(c);
+      tryPlay(c, "customer");
     }
     if (s && floorInbound.sales) {
+      console.log("[Supervisor] Setting sales audio stream, vol=", vol);
       s.srcObject = floorInbound.sales;
       s.volume = vol;
-      tryPlay(s);
+      tryPlay(s, "sales");
     }
   }, [auth?.role, floorInbound.customer, floorInbound.sales, vol]);
 
