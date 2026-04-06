@@ -59,6 +59,7 @@ export default function App() {
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const socket = useMemo(() => createMixerSocket(), []);
   const localStreamRef = useRef(null);
+  const localStreamPromiseRef = useRef(null);
   const peerConnectionsRef = useRef(new Map());
   const audioFloorCustomerRef = useRef(null);
   const audioFloorSalesRef = useRef(null);
@@ -149,30 +150,36 @@ export default function App() {
 
         await pc.setRemoteDescription(sdp);
 
-        // Acquire supervisor mic if not already captured
-        if (!localStreamRef.current) {
-          try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-              },
-              video: false,
-            });
+        // Acquire supervisor mic — use a shared promise so concurrent
+        // offer handlers don't race on getUserMedia.
+        if (!localStreamPromiseRef.current) {
+          localStreamPromiseRef.current = navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+            video: false,
+          }).then((stream) => {
             localStreamRef.current = stream;
             setMediaError("");
             socket.emit("media:micState", { micOn: true });
-          } catch (micErr) {
+            return stream;
+          }).catch((micErr) => {
             console.warn("[Supervisor] Mic unavailable (talk-back disabled):", micErr.message);
             setMediaError("Supervisor mic unavailable — you can hear floor but cannot talk back.");
-          }
+            return null;
+          });
         }
+        await localStreamPromiseRef.current;
 
-        // Add supervisor mic to this PC for talk-back
+        // Add supervisor mic to this PC for talk-back.
+        // Clone the track so each PC has its own independent copy —
+        // Chrome can fail to encode the same track on two senders.
         if (localStreamRef.current) {
-          const track = localStreamRef.current.getAudioTracks()[0];
-          if (track) {
+          const srcTrack = localStreamRef.current.getAudioTracks()[0];
+          if (srcTrack) {
+            const track = srcTrack.clone();
             const transceivers = pc.getTransceivers().filter(
               (t) => t.receiver?.track?.kind === "audio" && !t.stopped
             );
@@ -182,7 +189,7 @@ export default function App() {
             } else {
               pc.addTrack(track);
             }
-            console.log(`[Supervisor] Added mic to ${ch} PC for talk-back`);
+            console.log(`[Supervisor] Added mic clone to ${ch} PC for talk-back`);
           }
         }
 
@@ -264,32 +271,36 @@ export default function App() {
   }
 
   async function startLocalAudio() {
-    try {
-      if (localStreamRef.current) {
-        if (authRef.current?.role === "supervisor") {
-          socket.emit("media:micState", { micOn: true });
-        }
-        return;
+    if (localStreamRef.current) {
+      if (authRef.current?.role === "supervisor") {
+        socket.emit("media:micState", { micOn: true });
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
+      return;
+    }
+    if (!localStreamPromiseRef.current) {
+      localStreamPromiseRef.current = navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
         },
         video: false,
+      }).then((stream) => {
+        localStreamRef.current = stream;
+        setMediaError("");
+        if (authRef.current?.role === "supervisor") {
+          socket.emit("media:micState", { micOn: true });
+        }
+        return stream;
+      }).catch(() => {
+        setMediaError("Microphone permission denied or unavailable.");
+        if (authRef.current?.role === "supervisor") {
+          socket.emit("media:micState", { micOn: false });
+        }
+        return null;
       });
-      localStreamRef.current = stream;
-      setMediaError("");
-      if (authRef.current?.role === "supervisor") {
-        socket.emit("media:micState", { micOn: true });
-      }
-    } catch {
-      setMediaError("Microphone permission denied or unavailable.");
-      if (authRef.current?.role === "supervisor") {
-        socket.emit("media:micState", { micOn: false });
-      }
     }
+    await localStreamPromiseRef.current;
   }
 
   useEffect(() => {
