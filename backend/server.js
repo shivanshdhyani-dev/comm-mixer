@@ -231,33 +231,36 @@ io.on("connection", (socket) => {
     }));
   });
 
-  socket.on("webrtc:offer", ({ targetSocketId, sdp }) => {
+  socket.on("webrtc:offer", ({ targetSocketId, sdp, channel }) => {
     const session = getSession(socket);
     if (!session || !targetSocketId || !sdp) return;
     io.to(targetSocketId).emit("webrtc:offer", {
       fromSocketId: socket.id,
       fromRole: session.role,
       sdp,
+      channel,
     });
   });
 
-  socket.on("webrtc:answer", ({ targetSocketId, sdp }) => {
+  socket.on("webrtc:answer", ({ targetSocketId, sdp, channel }) => {
     const session = getSession(socket);
     if (!session || !targetSocketId || !sdp) return;
     io.to(targetSocketId).emit("webrtc:answer", {
       fromSocketId: socket.id,
       fromRole: session.role,
       sdp,
+      channel,
     });
   });
 
-  socket.on("webrtc:ice", ({ targetSocketId, candidate }) => {
+  socket.on("webrtc:ice", ({ targetSocketId, candidate, channel }) => {
     const session = getSession(socket);
     if (!session || !targetSocketId || !candidate) return;
     io.to(targetSocketId).emit("webrtc:ice", {
       fromSocketId: socket.id,
       fromRole: session.role,
       candidate,
+      channel,
     });
   });
 

@@ -2,8 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getIceServers } from "../webrtcConfig";
 
 /**
- * Store laptop: two headset mics (customer + sales) → mixed into one stream → supervisor.
- * Supervisor talk-back → split to customer vs sales headset outputs via setSinkId.
+ * Store laptop: two headset mics (customer + sales) → supervisor.
+ * Uses TWO separate RTCPeerConnections (one per channel) so each
+ * supervisor talk-back track plays on its own <audio> element.
+ * Chrome only allows one WebRTC remote track per audio element,
+ * so a single PC with two tracks cannot route to two headsets.
  */
 export default function FloorStationPanel({
   socket,
@@ -21,40 +24,35 @@ export default function FloorStationPanel({
   const [linking, setLinking] = useState(false);
   const [linked, setLinked] = useState(false);
   const [inputLevels, setInputLevels] = useState({ customer: 0, sales: 0 });
+  const [testing, setTesting] = useState("");
 
-  const pcRef = useRef(null);
+  const pcCustomerRef = useRef(null);
+  const pcSalesRef = useRef(null);
   const customerStreamRef = useRef(null);
   const salesStreamRef = useRef(null);
-  const captureMixCtxRef = useRef(null);
   const meterRafRef = useRef(null);
   const meterCtxRef = useRef(null);
-  const supervisorStreamRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const gainCustomerRef = useRef(null);
-  const gainSalesRef = useRef(null);
   const outAudioCustomerRef = useRef(null);
   const outAudioSalesRef = useRef(null);
-  const pendingCandidatesRef = useRef([]);
+  const pendingCandidatesRef = useRef({ customer: [], sales: [] });
+  const permissionGrantedRef = useRef(false);
 
   const supervisor = presence.find((p) => p.role === "supervisor");
 
   // ─── Device enumeration ───
 
   const refreshDevices = useCallback(async () => {
-    // Browsers hide device labels (and sometimes entire devices) until
-    // getUserMedia has been granted at least once.  Request a throwaway
-    // stream so enumerateDevices returns real labels and the full list.
-    try {
-      const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
-      tmp.getTracks().forEach((t) => t.stop());
-    } catch {
-      // Permission denied — enumerateDevices will still work but labels
-      // may be blank.  We carry on so the user can at least see entries.
+    if (!permissionGrantedRef.current) {
+      try {
+        const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+        tmp.getTracks().forEach((t) => t.stop());
+        permissionGrantedRef.current = true;
+      } catch {
+        /* permission denied — carry on with what we can get */
+      }
     }
 
     const list = await navigator.mediaDevices.enumerateDevices();
-    // Filter out "default" and "communications" virtual devices — they alias real
-    // hardware and cause both dropdowns to capture the same physical mic.
     setInputs(
       list.filter(
         (d) =>
@@ -82,30 +80,25 @@ export default function FloorStationPanel({
   // ─── Teardown helpers ───
 
   const teardownPlayback = useCallback(() => {
-    supervisorStreamRef.current = null;
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close();
-      audioCtxRef.current = null;
-    }
-    gainCustomerRef.current = null;
-    gainSalesRef.current = null;
-    if (outAudioCustomerRef.current) outAudioCustomerRef.current.srcObject = null;
-    if (outAudioSalesRef.current) outAudioSalesRef.current.srcObject = null;
+    const elC = outAudioCustomerRef.current;
+    const elS = outAudioSalesRef.current;
+    if (elC) elC.srcObject = null;
+    if (elS) elS.srcObject = null;
   }, []);
 
   const teardown = useCallback(() => {
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
+    if (pcCustomerRef.current) {
+      pcCustomerRef.current.close();
+      pcCustomerRef.current = null;
+    }
+    if (pcSalesRef.current) {
+      pcSalesRef.current.close();
+      pcSalesRef.current = null;
     }
     customerStreamRef.current?.getTracks?.().forEach((t) => t.stop());
     salesStreamRef.current?.getTracks?.().forEach((t) => t.stop());
     customerStreamRef.current = null;
     salesStreamRef.current = null;
-    if (captureMixCtxRef.current) {
-      captureMixCtxRef.current.close();
-      captureMixCtxRef.current = null;
-    }
     if (meterRafRef.current) {
       cancelAnimationFrame(meterRafRef.current);
       meterRafRef.current = null;
@@ -160,60 +153,20 @@ export default function FloorStationPanel({
     meterRafRef.current = requestAnimationFrame(tick);
   }, []);
 
-  // ─── Supervisor talk-back → headset outputs ───
+  // ─── Supervisor talk-back volume (mode-based) ───
 
-  const buildTalkbackGraph = useCallback(
-    (supervisorStream) => {
-      teardownPlayback();
-      supervisorStreamRef.current = supervisorStream;
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioCtx();
-      audioCtxRef.current = ctx;
-      void ctx.resume().catch(() => {});
-      const src = ctx.createMediaStreamSource(supervisorStream);
-      const gC = ctx.createGain();
-      const gS = ctx.createGain();
-      gainCustomerRef.current = gC;
-      gainSalesRef.current = gS;
-      src.connect(gC);
-      src.connect(gS);
-      const destC = ctx.createMediaStreamDestination();
-      const destS = ctx.createMediaStreamDestination();
-      gC.connect(destC);
-      gS.connect(destS);
-
-      const elC = outAudioCustomerRef.current;
-      const elS = outAudioSalesRef.current;
-      if (elC) {
-        elC.srcObject = destC.stream;
-        elC.autoplay = true;
-        elC.play().catch(() => {});
-        if (sinkCustomer && elC.setSinkId) elC.setSinkId(sinkCustomer).catch(() => {});
-      }
-      if (elS) {
-        elS.srcObject = destS.stream;
-        elS.autoplay = true;
-        elS.play().catch(() => {});
-        if (sinkSales && elS.setSinkId) elS.setSinkId(sinkSales).catch(() => {});
-      }
-    },
-    [sinkCustomer, sinkSales, teardownPlayback]
-  );
-
-  // ─── React to supervisor mode changes (talk-back gain) ───
+  const modeRef = useRef(mixerState.mode);
+  modeRef.current = mixerState.mode;
 
   useEffect(() => {
     const mode = mixerState.mode;
-    const gC = gainCustomerRef.current;
-    const gS = gainSalesRef.current;
-    if (!gC || !gS) return;
-    if (mode === "listen") {
-      gC.gain.value = 0;
-      gS.gain.value = 0;
-      return;
-    }
-    gC.gain.value = mode === "talk-customer" || mode === "talk-both" ? 1 : 0;
-    gS.gain.value = mode === "talk-sales" || mode === "talk-both" ? 1 : 0;
+    const cVal = mode === "talk-customer" || mode === "talk-both" ? 1 : 0;
+    const sVal = mode === "talk-sales" || mode === "talk-both" ? 1 : 0;
+    const elC = outAudioCustomerRef.current;
+    const elS = outAudioSalesRef.current;
+    if (elC?.srcObject) elC.volume = cVal;
+    if (elS?.srcObject) elS.volume = sVal;
+    console.log(`[Floor] Talkback volume: mode="${mode}" customer=${cVal} sales=${sVal}`);
   }, [mixerState.mode]);
 
   useEffect(() => {
@@ -238,46 +191,113 @@ export default function FloorStationPanel({
     applyMicMutes();
   }, [applyMicMutes]);
 
-  // ─── WebRTC answer / ICE from supervisor ───
+  // ─── Test a single mic ───
+
+  const testMic = useCallback(async (deviceId, label) => {
+    if (testing || linked) return;
+    setTesting(label);
+    let stream = null;
+    let ctx = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { deviceId: { exact: deviceId } },
+        video: false,
+      });
+      permissionGrantedRef.current = true;
+      refreshDevices().catch(() => {});
+
+      const track = stream.getAudioTracks()[0];
+      console.log(`[Floor] Testing mic: ${track.label} (enabled=${track.enabled} readyState=${track.readyState})`);
+
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      ctx = new AudioCtx();
+      await ctx.resume();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+      const buf = new Uint8Array(256);
+
+      let maxLevel = 0;
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        analyser.getByteTimeDomainData(buf);
+        let sum = 0;
+        for (let j = 0; j < buf.length; j++) {
+          const v = (buf[j] - 128) / 128;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / buf.length) * 100;
+        if (rms > maxLevel) maxLevel = rms;
+        const pct = Math.min(100, Math.round(rms * 2.4));
+        if (label === "customer") setInputLevels((l) => ({ ...l, customer: pct }));
+        else setInputLevels((l) => ({ ...l, sales: pct }));
+      }
+
+      if (maxLevel < 0.5) {
+        setStatus(`"${track.label}" captured but SILENT (0% audio). Check: hardware mute button, Windows mic volume, headset connection.`);
+        console.warn(`[Floor] Mic test FAILED — "${track.label}" produced 0% audio for 3 seconds`);
+      } else {
+        setStatus(`"${track.label}" is working (peak ${maxLevel.toFixed(1)}%)`);
+        console.log(`[Floor] Mic test OK — "${track.label}" peak level ${maxLevel.toFixed(1)}%`);
+      }
+    } catch (e) {
+      setStatus(`Mic test failed: ${e.message}`);
+    } finally {
+      stream?.getTracks().forEach((t) => t.stop());
+      ctx?.close();
+      setTesting("");
+      setInputLevels({ customer: 0, sales: 0 });
+    }
+  }, [testing, linked, refreshDevices]);
+
+  // ─── WebRTC answer / ICE from supervisor (channel-aware) ───
 
   useEffect(() => {
-    const onAnswer = async ({ fromSocketId, sdp }) => {
+    const onAnswer = async ({ fromSocketId, sdp, channel }) => {
       if (!supervisor || fromSocketId !== supervisor.socketId) return;
-      const pc = pcRef.current;
+      const ch = channel || "customer";
+      const pc = ch === "sales" ? pcSalesRef.current : pcCustomerRef.current;
       if (!pc || !sdp) return;
       try {
         await pc.setRemoteDescription(sdp);
-        console.log("[Floor] Remote description set, flushing", pendingCandidatesRef.current.length, "buffered candidates");
-        // Flush any ICE candidates that arrived before the answer
-        for (const c of pendingCandidatesRef.current) {
+        console.log(`[Floor] Remote description set for ${ch}, flushing buffered candidates`);
+        const buffered = pendingCandidatesRef.current[ch] || [];
+        for (const c of buffered) {
           try {
             await pc.addIceCandidate(c);
           } catch (err) {
-            console.warn("[Floor] Failed to add buffered ICE candidate:", err.message);
+            console.warn(`[Floor] Failed to add buffered ICE candidate (${ch}):`, err.message);
           }
         }
-        pendingCandidatesRef.current = [];
-        setStatus("Linked with supervisor — both mics streaming");
-        setLinked(true);
-      } catch {
-        setStatus("Failed to apply answer from supervisor");
+        pendingCandidatesRef.current[ch] = [];
+        // Mark linked once both PCs have remote descriptions
+        const otherPc = ch === "sales" ? pcCustomerRef.current : pcSalesRef.current;
+        if (otherPc?.remoteDescription) {
+          setStatus("Linked with supervisor — both mics streaming");
+          setLinked(true);
+        } else {
+          setStatus(`${ch} channel linked, waiting for other…`);
+        }
+      } catch (e) {
+        setStatus(`Failed to apply answer from supervisor (${ch})`);
       }
     };
 
-    const onIce = async ({ fromSocketId, candidate }) => {
+    const onIce = async ({ fromSocketId, candidate, channel }) => {
       if (!supervisor || fromSocketId !== supervisor.socketId || !candidate) return;
-      const pc = pcRef.current;
+      const ch = channel || "customer";
+      const pc = ch === "sales" ? pcSalesRef.current : pcCustomerRef.current;
       if (!pc) return;
-      // Buffer candidates until remote description (answer) is set
       if (!pc.remoteDescription) {
-        console.log("[Floor] Buffering ICE candidate (no remote desc yet)");
-        pendingCandidatesRef.current.push(candidate);
+        pendingCandidatesRef.current[ch] = pendingCandidatesRef.current[ch] || [];
+        pendingCandidatesRef.current[ch].push(candidate);
         return;
       }
       try {
         await pc.addIceCandidate(candidate);
       } catch (err) {
-        console.warn("[Floor] Failed to add ICE candidate:", err.message);
+        console.warn(`[Floor] Failed to add ICE candidate (${ch}):`, err.message);
       }
     };
 
@@ -289,7 +309,7 @@ export default function FloorStationPanel({
     };
   }, [socket, supervisor]);
 
-  // ─── Core: start link ───
+  // ─── Core: start link (two PCs — one per channel) ───
 
   const startLink = async () => {
     if (!supervisor) {
@@ -307,33 +327,23 @@ export default function FloorStationPanel({
 
     setLinking(true);
     setStatus("Requesting microphone access…");
-    pendingCandidatesRef.current = [];
+    pendingCandidatesRef.current = { customer: [], sales: [] };
     teardown();
 
     try {
-      // 1) Capture customer mic
-      const cStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: { exact: micCustomer },
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1,
-        },
-        video: false,
-      });
+      const [cStream, sStream] = await Promise.all([
+        navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: { exact: micCustomer } },
+          video: false,
+        }),
+        navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: { exact: micSales } },
+          video: false,
+        }),
+      ]);
 
-      // 2) Capture sales mic
-      const sStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: { exact: micSales },
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1,
-        },
-        video: false,
-      });
+      permissionGrantedRef.current = true;
+      refreshDevices().catch(() => {});
 
       const cTrack = cStream.getAudioTracks()[0];
       const sTrack = sStream.getAudioTracks()[0];
@@ -359,60 +369,86 @@ export default function FloorStationPanel({
       startMeters(cStream, sStream);
       applyMicMutes();
 
-      // 5) Create WebRTC peer connection — send both tracks separately
-      //    so the supervisor can control each mic independently.
-      setStatus("Setting up WebRTC…");
-      const pc = new RTCPeerConnection({
+      setStatus("Setting up WebRTC (two channels)…");
+
+      const rtcConfig = {
         iceServers: getIceServers(),
         bundlePolicy: "max-bundle",
-      });
-      pcRef.current = pc;
-
-      pc.onicecandidate = (e) => {
-        if (!e.candidate || !supervisor) return;
-        const c = e.candidate;
-        console.log(`[Floor] ICE candidate: ${c.type || "?"} ${c.protocol} ${c.address}:${c.port}`);
-        socket.emit("webrtc:ice", {
-          targetSocketId: supervisor.socketId,
-          candidate: c,
-        });
+        iceTransportPolicy: "relay",
       };
 
-      pc.ontrack = (ev) => {
-        const [stream] = ev.streams;
-        if (stream?.getAudioTracks().length) {
-          buildTalkbackGraph(stream);
-        }
+      // Helper: create one RTCPeerConnection for a single channel
+      const createChannelPC = (track, stream, channel, audioElRef, sinkId) => {
+        const pc = new RTCPeerConnection(rtcConfig);
+
+        pc.onicecandidate = (e) => {
+          if (!e.candidate || !supervisor) return;
+          socket.emit("webrtc:ice", {
+            targetSocketId: supervisor.socketId,
+            candidate: e.candidate,
+            channel,
+          });
+        };
+
+        pc.ontrack = (ev) => {
+          if (ev.track.kind !== "audio") return;
+          const el = audioElRef.current;
+          if (!el) return;
+          el.srcObject = new MediaStream([ev.track]);
+          el.volume = 1;
+          if (sinkId && el.setSinkId) el.setSinkId(sinkId).catch(() => {});
+          el.play().then(() => {
+            const mode = modeRef.current;
+            const isActive = channel === "customer"
+              ? (mode === "talk-customer" || mode === "talk-both")
+              : (mode === "talk-sales" || mode === "talk-both");
+            el.volume = isActive ? 1 : 0;
+            console.log(`[Floor] Talkback → ${channel} headset (audio element, vol=${el.volume})`);
+          }).catch((err) => console.warn(`[Floor] ${channel} talkback play failed:`, err.message));
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          const state = pc.iceConnectionState;
+          console.log(`[Floor] ICE ${channel}: ${state}`);
+          if (state === "connected" || state === "completed") {
+            setLinked(true);
+            setStatus("Connected — supervisor hearing both mics");
+          } else if (state === "checking") {
+            setStatus(`Connecting ${channel} channel…`);
+          } else if (state === "disconnected") {
+            setStatus(`${channel} channel interrupted — reconnecting…`);
+          } else if (state === "failed") {
+            setStatus(`${channel} channel failed — TURN relay may be down. Try again.`);
+          }
+        };
+
+        pc.addTrack(track, stream);
+        return pc;
       };
 
-      pc.oniceconnectionstatechange = () => {
-        const state = pc.iceConnectionState;
-        console.log("[Floor] ICE connection state:", state);
-        if (state === "connected" || state === "completed") {
-          setStatus("Connected — supervisor hearing both mics");
-          setLinked(true);
-        } else if (state === "checking") {
-          setStatus("Connecting to supervisor…");
-        } else if (state === "disconnected") {
-          setStatus("Connection interrupted — trying to reconnect…");
-        } else if (state === "failed") {
-          setStatus("Connection failed — TURN relay may be down. Try again.");
-          setLinked(false);
-        }
-      };
+      const pcC = createChannelPC(cTrack, cStream, "customer", outAudioCustomerRef, sinkCustomer);
+      const pcS = createChannelPC(sTrack, sStream, "sales", outAudioSalesRef, sinkSales);
+      pcCustomerRef.current = pcC;
+      pcSalesRef.current = pcS;
 
-      // 6) Add both mic tracks separately (customer first, then sales)
-      pc.addTrack(cTrack, cStream);
-      pc.addTrack(sTrack, sStream);
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
+      // Send offers for both channels
+      const offerC = await pcC.createOffer();
+      await pcC.setLocalDescription(offerC);
       socket.emit("webrtc:offer", {
         targetSocketId: supervisor.socketId,
-        sdp: offer,
+        sdp: offerC,
+        channel: "customer",
       });
 
-      setStatus("Offer sent — waiting for supervisor…");
+      const offerS = await pcS.createOffer();
+      await pcS.setLocalDescription(offerS);
+      socket.emit("webrtc:offer", {
+        targetSocketId: supervisor.socketId,
+        sdp: offerS,
+        channel: "sales",
+      });
+
+      setStatus("Offers sent — waiting for supervisor…");
 
       const customerLabel = cTrack.label || "Customer mic";
       const salesLabel = sTrack.label || "Sales mic";
@@ -476,31 +512,51 @@ export default function FloorStationPanel({
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div>
           <label className="mb-1 block text-xs text-zinc-500">Customer headset mic</label>
-          <select
-            value={micCustomer}
-            onChange={(e) => setMicCustomer(e.target.value)}
-            className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
-          >
-            {inputs.map((d) => (
-              <option key={d.deviceId} value={d.deviceId}>
-                {d.label || "Microphone"}
-              </option>
-            ))}
-          </select>
+          <div className="flex gap-2">
+            <select
+              value={micCustomer}
+              onChange={(e) => setMicCustomer(e.target.value)}
+              className="min-w-0 flex-1 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
+            >
+              {inputs.map((d) => (
+                <option key={d.deviceId} value={d.deviceId}>
+                  {d.label || "Microphone"}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              disabled={!micCustomer || !!testing || linked}
+              onClick={() => testMic(micCustomer, "customer")}
+              className="shrink-0 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-xs text-zinc-400 hover:text-white disabled:opacity-40"
+            >
+              {testing === "customer" ? "Testing…" : "Test"}
+            </button>
+          </div>
         </div>
         <div>
           <label className="mb-1 block text-xs text-zinc-500">Sales headset mic</label>
-          <select
-            value={micSales}
-            onChange={(e) => setMicSales(e.target.value)}
-            className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
-          >
-            {inputs.map((d) => (
-              <option key={`s-${d.deviceId}`} value={d.deviceId}>
-                {d.label || "Microphone"}
-              </option>
-            ))}
-          </select>
+          <div className="flex gap-2">
+            <select
+              value={micSales}
+              onChange={(e) => setMicSales(e.target.value)}
+              className="min-w-0 flex-1 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white"
+            >
+              {inputs.map((d) => (
+                <option key={`s-${d.deviceId}`} value={d.deviceId}>
+                  {d.label || "Microphone"}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              disabled={!micSales || !!testing || linked}
+              onClick={() => testMic(micSales, "sales")}
+              className="shrink-0 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-xs text-zinc-400 hover:text-white disabled:opacity-40"
+            >
+              {testing === "sales" ? "Testing…" : "Test"}
+            </button>
+          </div>
         </div>
         <div>
           <label className="mb-1 block text-xs text-zinc-500">

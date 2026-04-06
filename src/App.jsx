@@ -62,7 +62,6 @@ export default function App() {
   const peerConnectionsRef = useRef(new Map());
   const audioFloorCustomerRef = useRef(null);
   const audioFloorSalesRef = useRef(null);
-  const floorInboundOrderRef = useRef(0);
   const loginTimeoutRef = useRef(null);
   const authRef = useRef(null);
   authRef.current = auth;
@@ -101,60 +100,56 @@ export default function App() {
       cleanupPeers();
     };
 
-    const handleOffer = async ({ fromSocketId, fromRole, sdp }) => {
+    const handleOffer = async ({ fromSocketId, fromRole, sdp, channel }) => {
       if (!sdp || authRef.current?.role !== "supervisor" || fromRole !== "floor") return;
+      const ch = channel || "customer";
+      const pcKey = `${fromSocketId}:${ch}`;
 
       try {
-        floorInboundOrderRef.current = 0;
-        setFloorInbound({ customer: null, sales: null });
+        // Only reset state on the first channel offer from a new floor connection
+        if (ch === "customer") {
+          setFloorInbound((prev) => ({ ...prev, customer: null }));
+        } else {
+          setFloorInbound((prev) => ({ ...prev, sales: null }));
+        }
         setFloorConnectionState("connecting");
 
-        const existing = peerConnectionsRef.current.get(fromSocketId);
+        const existing = peerConnectionsRef.current.get(pcKey);
         if (existing) existing.close();
 
         const pc = new RTCPeerConnection({
           iceServers: getIceServers(),
           bundlePolicy: "max-bundle",
+          iceTransportPolicy: "relay",
         });
-        peerConnectionsRef.current.set(fromSocketId, pc);
+        peerConnectionsRef.current.set(pcKey, pc);
 
         pc.oniceconnectionstatechange = () => {
           const state = pc.iceConnectionState;
-          console.log("[Supervisor] ICE connection state:", state);
+          console.log(`[Supervisor] ICE ${ch}: ${state}`);
           setFloorConnectionState(state);
         };
 
         pc.onicecandidate = (event) => {
           if (!event.candidate) return;
-          const c = event.candidate;
-          console.log(`[Supervisor] ICE candidate: ${c.type || "?"} ${c.protocol} ${c.address}:${c.port}`);
           socket.emit("webrtc:ice", {
             targetSocketId: fromSocketId,
-            candidate: c,
+            candidate: event.candidate,
+            channel: ch,
           });
         };
 
         pc.ontrack = (event) => {
-          const [stream] = event.streams;
-          if (!stream) return;
-          const idx = floorInboundOrderRef.current++;
-          const label = idx === 0 ? "customer" : "sales";
           const track = event.track;
-          console.log(`[Supervisor] ontrack #${idx} (${label}): kind=${track.kind} enabled=${track.enabled} muted=${track.muted} readyState=${track.readyState}`);
-          if (idx === 0) {
-            setFloorInbound((prev) => ({ ...prev, customer: stream }));
-          } else {
-            setFloorInbound((prev) => ({ ...prev, sales: stream }));
-          }
+          if (track.kind !== "audio") return;
+          const stream = new MediaStream([track]);
+          console.log(`[Supervisor] ontrack (${ch}): enabled=${track.enabled} readyState=${track.readyState}`);
+          setFloorInbound((prev) => ({ ...prev, [ch]: stream }));
         };
 
-        // Set remote description IMMEDIATELY so incoming ICE candidates
-        // from the floor can be processed. Any async work (getUserMedia)
-        // must happen AFTER this — otherwise early candidates are silently
-        // lost and ICE goes checking → disconnected.
         await pc.setRemoteDescription(sdp);
 
-        // Now acquire supervisor mic for talk-back
+        // Acquire supervisor mic if not already captured
         if (!localStreamRef.current) {
           try {
             const stream = await navigator.mediaDevices.getUserMedia({
@@ -174,43 +169,55 @@ export default function App() {
           }
         }
 
-        // Add talk-back track before createAnswer so the answer SDP
-        // includes a sendrecv transceiver for the supervisor's mic.
+        // Add supervisor mic to this PC for talk-back
         if (localStreamRef.current) {
           const track = localStreamRef.current.getAudioTracks()[0];
           if (track) {
-            pc.addTrack(track, localStreamRef.current);
+            const transceivers = pc.getTransceivers().filter(
+              (t) => t.receiver?.track?.kind === "audio" && !t.stopped
+            );
+            if (transceivers.length > 0) {
+              transceivers[0].direction = "sendrecv";
+              await transceivers[0].sender.replaceTrack(track);
+            } else {
+              pc.addTrack(track);
+            }
+            console.log(`[Supervisor] Added mic to ${ch} PC for talk-back`);
           }
         }
 
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
-        console.log("[Supervisor] Answer sent to floor");
+        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer, channel: ch });
+        console.log(`[Supervisor] Answer sent to floor (${ch})`);
       } catch (err) {
-        console.error("[Supervisor] handleOffer failed:", err);
+        console.error(`[Supervisor] handleOffer (${ch}) failed:`, err);
         setMediaError("Failed to establish connection with floor: " + err.message);
         setFloorConnectionState("failed");
       }
     };
 
-    const handleIce = async ({ fromSocketId, candidate }) => {
+    const handleIce = async ({ fromSocketId, candidate, channel }) => {
       if (!candidate) return;
-      const pc = peerConnectionsRef.current.get(fromSocketId);
+      const ch = channel || "customer";
+      const pc = peerConnectionsRef.current.get(`${fromSocketId}:${ch}`);
       if (!pc) return;
       try {
         await pc.addIceCandidate(candidate);
       } catch (err) {
-        console.warn("[Supervisor] Failed to add ICE candidate:", err.message);
+        console.warn(`[Supervisor] Failed to add ICE candidate (${ch}):`, err.message);
       }
     };
 
     const handlePeerLeft = ({ socketId, role }) => {
       if (role !== "floor") return;
-      const pc = peerConnectionsRef.current.get(socketId);
-      if (pc) {
-        pc.close();
-        peerConnectionsRef.current.delete(socketId);
+      for (const ch of ["customer", "sales"]) {
+        const pcKey = `${socketId}:${ch}`;
+        const pc = peerConnectionsRef.current.get(pcKey);
+        if (pc) {
+          pc.close();
+          peerConnectionsRef.current.delete(pcKey);
+        }
       }
       setFloorInbound({ customer: null, sales: null });
     };
