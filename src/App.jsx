@@ -141,13 +141,8 @@ export default function App() {
           }
         };
 
-        await pc.setRemoteDescription(sdp);
-
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
-        console.log("[Supervisor] Answer sent to floor");
-
+        // Acquire supervisor mic BEFORE creating the answer so the SDP
+        // correctly advertises sendrecv (bidirectional) instead of recvonly.
         if (!localStreamRef.current) {
           try {
             const stream = await navigator.mediaDevices.getUserMedia({
@@ -167,12 +162,21 @@ export default function App() {
           }
         }
 
+        await pc.setRemoteDescription(sdp);
+
+        // Add talk-back track before createAnswer so the answer SDP
+        // includes a sendrecv transceiver for the supervisor's mic.
         if (localStreamRef.current) {
           const track = localStreamRef.current.getAudioTracks()[0];
           if (track) {
             pc.addTrack(track, localStreamRef.current);
           }
         }
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("webrtc:answer", { targetSocketId: fromSocketId, sdp: answer });
+        console.log("[Supervisor] Answer sent to floor");
       } catch (err) {
         console.error("[Supervisor] handleOffer failed:", err);
         setMediaError("Failed to establish connection with floor: " + err.message);
