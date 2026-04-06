@@ -40,6 +40,17 @@ export default function FloorStationPanel({
   // ─── Device enumeration ───
 
   const refreshDevices = useCallback(async () => {
+    // Browsers hide device labels (and sometimes entire devices) until
+    // getUserMedia has been granted at least once.  Request a throwaway
+    // stream so enumerateDevices returns real labels and the full list.
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+      tmp.getTracks().forEach((t) => t.stop());
+    } catch {
+      // Permission denied — enumerateDevices will still work but labels
+      // may be blank.  We carry on so the user can at least see entries.
+    }
+
     const list = await navigator.mediaDevices.enumerateDevices();
     // Filter out "default" and "communications" virtual devices — they alias real
     // hardware and cause both dropdowns to capture the same physical mic.
