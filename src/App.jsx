@@ -112,7 +112,10 @@ export default function App() {
         const existing = peerConnectionsRef.current.get(fromSocketId);
         if (existing) existing.close();
 
-        const pc = new RTCPeerConnection({ iceServers: getIceServers() });
+        const pc = new RTCPeerConnection({
+          iceServers: getIceServers(),
+          bundlePolicy: "max-bundle",
+        });
         peerConnectionsRef.current.set(fromSocketId, pc);
 
         pc.oniceconnectionstatechange = () => {
@@ -123,9 +126,11 @@ export default function App() {
 
         pc.onicecandidate = (event) => {
           if (!event.candidate) return;
+          const c = event.candidate;
+          console.log(`[Supervisor] ICE candidate: ${c.type || "?"} ${c.protocol} ${c.address}:${c.port}`);
           socket.emit("webrtc:ice", {
             targetSocketId: fromSocketId,
-            candidate: event.candidate,
+            candidate: c,
           });
         };
 

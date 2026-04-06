@@ -19,17 +19,26 @@ export function getIceServers() {
   }
 
   return [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun.relay.metered.ca:80" },
     {
-      urls: "turn:freeturn.net:3478",
-      username: "free",
-      credential: "free",
+      urls: "turn:global.relay.metered.ca:80",
+      username: "c9f55f875ce4ce15621ac360",
+      credential: "3+gyTXEoTp2BNn5w",
     },
     {
-      urls: "turn:freeturn.net:5349",
-      username: "free",
-      credential: "free",
+      urls: "turn:global.relay.metered.ca:80?transport=tcp",
+      username: "c9f55f875ce4ce15621ac360",
+      credential: "3+gyTXEoTp2BNn5w",
+    },
+    {
+      urls: "turn:global.relay.metered.ca:443",
+      username: "c9f55f875ce4ce15621ac360",
+      credential: "3+gyTXEoTp2BNn5w",
+    },
+    {
+      urls: "turns:global.relay.metered.ca:443?transport=tcp",
+      username: "c9f55f875ce4ce15621ac360",
+      credential: "3+gyTXEoTp2BNn5w",
     },
   ];
 }

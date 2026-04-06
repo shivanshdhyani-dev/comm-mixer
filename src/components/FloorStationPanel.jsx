@@ -34,6 +34,7 @@ export default function FloorStationPanel({
   const gainSalesRef = useRef(null);
   const outAudioCustomerRef = useRef(null);
   const outAudioSalesRef = useRef(null);
+  const pendingCandidatesRef = useRef([]);
 
   const supervisor = presence.find((p) => p.role === "supervisor");
 
@@ -246,6 +247,16 @@ export default function FloorStationPanel({
       if (!pc || !sdp) return;
       try {
         await pc.setRemoteDescription(sdp);
+        console.log("[Floor] Remote description set, flushing", pendingCandidatesRef.current.length, "buffered candidates");
+        // Flush any ICE candidates that arrived before the answer
+        for (const c of pendingCandidatesRef.current) {
+          try {
+            await pc.addIceCandidate(c);
+          } catch (err) {
+            console.warn("[Floor] Failed to add buffered ICE candidate:", err.message);
+          }
+        }
+        pendingCandidatesRef.current = [];
         setStatus("Linked with supervisor — both mics streaming");
         setLinked(true);
       } catch {
@@ -257,6 +268,12 @@ export default function FloorStationPanel({
       if (!supervisor || fromSocketId !== supervisor.socketId || !candidate) return;
       const pc = pcRef.current;
       if (!pc) return;
+      // Buffer candidates until remote description (answer) is set
+      if (!pc.remoteDescription) {
+        console.log("[Floor] Buffering ICE candidate (no remote desc yet)");
+        pendingCandidatesRef.current.push(candidate);
+        return;
+      }
       try {
         await pc.addIceCandidate(candidate);
       } catch (err) {
@@ -290,6 +307,7 @@ export default function FloorStationPanel({
 
     setLinking(true);
     setStatus("Requesting microphone access…");
+    pendingCandidatesRef.current = [];
     teardown();
 
     try {
@@ -344,14 +362,19 @@ export default function FloorStationPanel({
       // 5) Create WebRTC peer connection — send both tracks separately
       //    so the supervisor can control each mic independently.
       setStatus("Setting up WebRTC…");
-      const pc = new RTCPeerConnection({ iceServers: getIceServers() });
+      const pc = new RTCPeerConnection({
+        iceServers: getIceServers(),
+        bundlePolicy: "max-bundle",
+      });
       pcRef.current = pc;
 
       pc.onicecandidate = (e) => {
         if (!e.candidate || !supervisor) return;
+        const c = e.candidate;
+        console.log(`[Floor] ICE candidate: ${c.type || "?"} ${c.protocol} ${c.address}:${c.port}`);
         socket.emit("webrtc:ice", {
           targetSocketId: supervisor.socketId,
-          candidate: e.candidate,
+          candidate: c,
         });
       };
 
