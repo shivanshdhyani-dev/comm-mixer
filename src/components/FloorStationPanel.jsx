@@ -248,8 +248,8 @@ export default function FloorStationPanel({
       if (!pc) return;
       try {
         await pc.addIceCandidate(candidate);
-      } catch {
-        /* ignore */
+      } catch (err) {
+        console.warn("[Floor] Failed to add ICE candidate:", err.message);
       }
     };
 

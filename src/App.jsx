@@ -141,8 +141,13 @@ export default function App() {
           }
         };
 
-        // Acquire supervisor mic BEFORE creating the answer so the SDP
-        // correctly advertises sendrecv (bidirectional) instead of recvonly.
+        // Set remote description IMMEDIATELY so incoming ICE candidates
+        // from the floor can be processed. Any async work (getUserMedia)
+        // must happen AFTER this — otherwise early candidates are silently
+        // lost and ICE goes checking → disconnected.
+        await pc.setRemoteDescription(sdp);
+
+        // Now acquire supervisor mic for talk-back
         if (!localStreamRef.current) {
           try {
             const stream = await navigator.mediaDevices.getUserMedia({
@@ -161,8 +166,6 @@ export default function App() {
             setMediaError("Supervisor mic unavailable — you can hear floor but cannot talk back.");
           }
         }
-
-        await pc.setRemoteDescription(sdp);
 
         // Add talk-back track before createAnswer so the answer SDP
         // includes a sendrecv transceiver for the supervisor's mic.
@@ -190,8 +193,8 @@ export default function App() {
       if (!pc) return;
       try {
         await pc.addIceCandidate(candidate);
-      } catch {
-        /* ignore */
+      } catch (err) {
+        console.warn("[Supervisor] Failed to add ICE candidate:", err.message);
       }
     };
 
