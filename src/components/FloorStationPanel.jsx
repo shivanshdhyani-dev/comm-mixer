@@ -25,7 +25,6 @@ export default function FloorStationPanel({
   const pcRef = useRef(null);
   const customerStreamRef = useRef(null);
   const salesStreamRef = useRef(null);
-  const mixedOutStreamRef = useRef(null);
   const captureMixCtxRef = useRef(null);
   const meterRafRef = useRef(null);
   const meterCtxRef = useRef(null);
@@ -91,7 +90,6 @@ export default function FloorStationPanel({
     salesStreamRef.current?.getTracks?.().forEach((t) => t.stop());
     customerStreamRef.current = null;
     salesStreamRef.current = null;
-    mixedOutStreamRef.current = null;
     if (captureMixCtxRef.current) {
       captureMixCtxRef.current.close();
       captureMixCtxRef.current = null;
@@ -332,25 +330,8 @@ export default function FloorStationPanel({
       startMeters(cStream, sStream);
       applyMicMutes();
 
-      setStatus("Mixing audio…");
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      const mixCtx = new AudioCtx();
-      captureMixCtxRef.current = mixCtx;
-      await mixCtx.resume();
-
-      const dest = mixCtx.createMediaStreamDestination();
-      const cSrc = mixCtx.createMediaStreamSource(cStream);
-      const sSrc = mixCtx.createMediaStreamSource(sStream);
-      cSrc.connect(dest);
-      sSrc.connect(dest);
-      mixedOutStreamRef.current = dest.stream;
-
-      const mixedTrack = dest.stream.getAudioTracks()[0];
-      if (!mixedTrack) {
-        throw new Error("Failed to create mixed audio track.");
-      }
-
-      // 5) Create WebRTC peer connection
+      // 5) Create WebRTC peer connection — send both tracks separately
+      //    so the supervisor can control each mic independently.
       setStatus("Setting up WebRTC…");
       const pc = new RTCPeerConnection({ iceServers: getIceServers() });
       pcRef.current = pc;
@@ -386,8 +367,9 @@ export default function FloorStationPanel({
         }
       };
 
-      // 6) Add mixed track and create offer
-      pc.addTrack(mixedTrack, dest.stream);
+      // 6) Add both mic tracks separately (customer first, then sales)
+      pc.addTrack(cTrack, cStream);
+      pc.addTrack(sTrack, sStream);
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);

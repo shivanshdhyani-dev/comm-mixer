@@ -133,11 +133,12 @@ export default function App() {
           const [stream] = event.streams;
           if (!stream) return;
           const idx = floorInboundOrderRef.current++;
+          // Floor sends customer track first (idx 0), then sales (idx 1)
           if (idx === 0) {
-            setFloorInbound({ customer: stream, sales: stream });
-            return;
+            setFloorInbound((prev) => ({ ...prev, customer: stream }));
+          } else {
+            setFloorInbound((prev) => ({ ...prev, sales: stream }));
           }
-          setFloorInbound((prev) => ({ ...prev, sales: stream }));
         };
 
         await pc.setRemoteDescription(sdp);
