@@ -4,12 +4,11 @@ import { getIceServers } from "../webrtcConfig";
 /**
  * Store laptop: two headset mics (customer + sales) → supervisor.
  *
- * Supervisor talk-back uses Web Audio API to split ONE WebRTC track into
- * TWO independent local streams — one per headset:
- *
- *   WebRTC track → <audio> (primary, intercepted by createMediaElementSource)
- *     → GainNode(customer) → MediaStreamDestination → <audio> setSinkId(customer)
- *     → GainNode(sales)    → MediaStreamDestination → <audio> setSinkId(sales)
+ * Supervisor talk-back uses a hybrid approach:
+ *   Customer earpiece: <audio> element + setSinkId (non-default device)
+ *   Sales earpiece: AudioContext → ctx.destination (system default device)
+ * Chrome on Mac can't reliably play two <audio> elements on different
+ * setSinkId devices simultaneously, so we mix the two pipelines.
  *
  * Mode controls gain values: 0 = muted, 1 = active.
  * Output elements play LOCAL streams (not WebRTC), so Chrome allows both.
@@ -38,14 +37,10 @@ export default function FloorStationPanel({
   const meterRafRef = useRef(null);
   const meterCtxRef = useRef(null);
 
-  // Talkback audio elements
-  const outAudioPrimaryRef = useRef(null);   // plays WebRTC track (intercepted)
-  const outAudioCustomerRef = useRef(null);  // plays local stream → customer headset
-  const outAudioSalesRef = useRef(null);     // plays local stream → sales headset
-
-  // Web Audio nodes for talkback splitting
+  // Talkback: customer uses setSinkId, sales uses AudioContext default output
+  const outAudioCustomerRef = useRef(null);  // → customer headset (setSinkId)
+  const outAudioSalesRef = useRef(null);     // → sales headset (AudioContext default)
   const talkbackCtxRef = useRef(null);
-  const gainCustomerRef = useRef(null);
   const gainSalesRef = useRef(null);
 
   const pendingCandidatesRef = useRef([]);
@@ -105,11 +100,8 @@ export default function FloorStationPanel({
     if (meterRafRef.current) { cancelAnimationFrame(meterRafRef.current); meterRafRef.current = null; }
     if (meterCtxRef.current) { meterCtxRef.current.close(); meterCtxRef.current = null; }
     if (talkbackCtxRef.current) { talkbackCtxRef.current.close(); talkbackCtxRef.current = null; }
-    gainCustomerRef.current = null;
     gainSalesRef.current = null;
-    [outAudioPrimaryRef, outAudioCustomerRef, outAudioSalesRef].forEach((ref) => {
-      if (ref.current) { ref.current.srcObject = null; }
-    });
+    if (outAudioCustomerRef.current) outAudioCustomerRef.current.srcObject = null;
     setInputLevels({ customer: 0, sales: 0 });
     setLinked(false);
   }, []);
@@ -150,16 +142,17 @@ export default function FloorStationPanel({
     meterRafRef.current = requestAnimationFrame(tick);
   }, []);
 
-  // ─── Talkback routing (gain-based) ───
+  // ─── Talkback routing ───
+  // Customer: volume on <audio> element (setSinkId route)
+  // Sales: GainNode on AudioContext (default output route)
 
   const applyTalkbackRouting = useCallback((mode) => {
-    const gC = gainCustomerRef.current;
+    const elC = outAudioCustomerRef.current;
     const gS = gainSalesRef.current;
-    if (!gC || !gS) return;
     const cVal = (mode === "talk-customer" || mode === "talk-both") ? 1 : 0;
     const sVal = (mode === "talk-sales" || mode === "talk-both") ? 1 : 0;
-    gC.gain.value = cVal;
-    gS.gain.value = sVal;
+    if (elC) elC.volume = cVal;
+    if (gS) gS.gain.value = sVal;
     console.log(`[Floor] Talkback: mode="${mode}" customer=${cVal} sales=${sVal}`);
   }, []);
 
@@ -167,13 +160,17 @@ export default function FloorStationPanel({
     applyTalkbackRouting(mixerState.mode);
   }, [mixerState.mode, applyTalkbackRouting]);
 
-  // Re-apply setSinkId when user changes output dropdowns
+  // Re-apply setSinkId for customer earpiece (sales uses AudioContext default)
   useEffect(() => {
     const elC = outAudioCustomerRef.current;
-    const elS = outAudioSalesRef.current;
-    if (elC && sinkCustomer && elC.setSinkId) elC.setSinkId(sinkCustomer).catch(() => {});
-    if (elS && sinkSales && elS.setSinkId) elS.setSinkId(sinkSales).catch(() => {});
-  }, [sinkCustomer, sinkSales]);
+    const cLabel = outputs.find((d) => d.deviceId === sinkCustomer)?.label || "default";
+    const sLabel = outputs.find((d) => d.deviceId === sinkSales)?.label || "default";
+    console.log(`[Floor] Earpiece config — Customer: "${cLabel}" (setSinkId) | Sales: "${sLabel}" (AudioContext default)`);
+    if (elC && sinkCustomer && elC.setSinkId)
+      elC.setSinkId(sinkCustomer)
+        .then(() => console.log("[Floor] Customer earpiece setSinkId OK:", cLabel))
+        .catch((e) => console.warn("[Floor] Customer earpiece setSinkId FAILED:", e.message));
+  }, [sinkCustomer, sinkSales, outputs]);
 
   // ─── Mic mute sync ───
 
@@ -313,68 +310,48 @@ export default function FloorStationPanel({
         socket.emit("webrtc:ice", { targetSocketId: supervisor.socketId, candidate: e.candidate });
       };
 
-      // ── Talkback: split ONE WebRTC track into TWO local outputs ──
+      // ── Talkback: clone WebRTC track to TWO audio elements ──
       let talkbackReceived = false;
-      pc.ontrack = (ev) => {
+      pc.ontrack = async (ev) => {
         if (ev.track.kind !== "audio" || talkbackReceived) return;
         talkbackReceived = true;
+        console.log("[Floor] Talkback track received, setting up hybrid output");
 
-        const elP = outAudioPrimaryRef.current;
-        if (!elP) return;
+        const track = ev.track;
 
-        elP.srcObject = new MediaStream([ev.track]);
-        elP.volume = 1;
-        elP.play().then(() => {
-          console.log("[Floor] Talkback track received, setting up audio split");
-
-          const AudioCtx = window.AudioContext || window.webkitAudioContext;
-          const ctx = new AudioCtx();
-          talkbackCtxRef.current = ctx;
-          ctx.resume();
-
-          // Intercept the primary element's audio output
-          const source = ctx.createMediaElementSource(elP);
-
-          // Customer path: source → gain → MediaStreamDestination → audio element
-          const gainC = ctx.createGain();
-          const destC = ctx.createMediaStreamDestination();
-          source.connect(gainC);
-          gainC.connect(destC);
-          gainCustomerRef.current = gainC;
-
-          // Sales path: source → gain → MediaStreamDestination → audio element
-          const gainS = ctx.createGain();
-          const destS = ctx.createMediaStreamDestination();
-          source.connect(gainS);
-          gainS.connect(destS);
-          gainSalesRef.current = gainS;
-
-          // Start muted (listen mode)
-          gainC.gain.value = 0;
-          gainS.gain.value = 0;
-
-          // Customer output element
-          const elC = outAudioCustomerRef.current;
-          if (elC) {
-            elC.srcObject = destC.stream;
-            if (sinkCustomerRef.current && elC.setSinkId)
-              elC.setSinkId(sinkCustomerRef.current).catch(() => {});
-            elC.play().catch((e) => console.warn("[Floor] Customer output play failed:", e.message));
+        // ── Customer: <audio> element with setSinkId ──
+        const elC = outAudioCustomerRef.current;
+        if (elC) {
+          elC.srcObject = new MediaStream([track.clone()]);
+          elC.volume = 0;
+          const sinkC = sinkCustomerRef.current;
+          if (sinkC && elC.setSinkId) {
+            try {
+              await elC.setSinkId(sinkC);
+              console.log("[Floor] Customer earpiece setSinkId OK:", sinkC);
+            } catch (e) {
+              console.warn("[Floor] Customer setSinkId FAILED:", e.message);
+            }
           }
+          await elC.play().catch((e) => console.warn("[Floor] Customer play failed:", e.message));
+          console.log("[Floor] Customer output playing via setSinkId");
+        }
 
-          // Sales output element
-          const elS = outAudioSalesRef.current;
-          if (elS) {
-            elS.srcObject = destS.stream;
-            if (sinkSalesRef.current && elS.setSinkId)
-              elS.setSinkId(sinkSalesRef.current).catch(() => {});
-            elS.play().catch((e) => console.warn("[Floor] Sales output play failed:", e.message));
-          }
+        // ── Sales: AudioContext → default output (system default device) ──
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioCtx();
+        talkbackCtxRef.current = ctx;
+        await ctx.resume();
+        const source = ctx.createMediaStreamSource(new MediaStream([track.clone()]));
+        const gainS = ctx.createGain();
+        gainS.gain.value = 0; // start muted
+        source.connect(gainS);
+        gainS.connect(ctx.destination); // → system default output
+        gainSalesRef.current = gainS;
+        console.log("[Floor] Sales output playing via AudioContext default destination");
 
-          // Apply current mode
-          applyTalkbackRouting(modeRef.current);
-          console.log("[Floor] Audio split to customer + sales headsets via AudioContext");
-        }).catch((e) => console.warn("[Floor] Talkback play failed:", e.message));
+        applyTalkbackRouting(modeRef.current);
+        console.log("[Floor] Hybrid talkback ready: customer=setSinkId, sales=AudioContext");
       };
 
       pc.oniceconnectionstatechange = () => {
@@ -421,6 +398,7 @@ export default function FloorStationPanel({
   // ─── UI ───
 
   const sameMicWarning = micCustomer && micSales && micCustomer === micSales;
+  const sameEarpieceWarning = sinkCustomer && sinkSales && sinkCustomer === sinkSales;
 
   return (
     <div className="glass rounded-2xl p-5">
@@ -487,6 +465,9 @@ export default function FloorStationPanel({
       {sameMicWarning && (
         <p className="mt-2 text-xs text-amber-300">Customer and Sales are set to the same microphone.</p>
       )}
+      {sameEarpieceWarning && (
+        <p className="mt-2 text-xs text-amber-300">Customer and Sales earpieces are set to the same output device — select different devices.</p>
+      )}
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
         {!linked ? (
@@ -529,12 +510,8 @@ export default function FloorStationPanel({
         }`}>{status}</p>
       )}
 
-      {/* Primary: plays WebRTC track (intercepted by createMediaElementSource) */}
-      <audio ref={outAudioPrimaryRef} className="hidden" playsInline />
-      {/* Customer output: plays local stream from MediaStreamDestination */}
+      {/* Customer earpiece (setSinkId route) — sales goes via AudioContext */}
       <audio ref={outAudioCustomerRef} className="hidden" playsInline />
-      {/* Sales output: plays local stream from MediaStreamDestination */}
-      <audio ref={outAudioSalesRef} className="hidden" playsInline />
     </div>
   );
 }

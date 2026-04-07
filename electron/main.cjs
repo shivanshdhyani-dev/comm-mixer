@@ -8,10 +8,10 @@ const isDev = !app.isPackaged;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    minWidth: 1024,
-    minHeight: 720,
+    width: 480,
+    height: 600,
+    minWidth: 360,
+    minHeight: 480,
     title: "CommMixer",
     icon: path.join(__dirname, "..", "build", "icon.png"),
     webPreferences: {
