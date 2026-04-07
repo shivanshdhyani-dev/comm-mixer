@@ -1,9 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import Header from "./components/Header";
-import ParticipantsSidebar from "./components/ParticipantsSidebar";
-import AudioRoutingGraph from "./components/AudioRoutingGraph";
 import SupervisorControls from "./components/SupervisorControls";
-import BottomBar from "./components/BottomBar";
 import AuthPanel from "./components/AuthPanel";
 import FloorStationPanel from "./components/FloorStationPanel";
 import { createMixerSocket } from "./services/socket";
@@ -71,7 +67,7 @@ export default function App() {
   const isAuthed = Boolean(auth?.role);
   const isSupervisor = auth?.role === "supervisor";
   const isFloor = auth?.role === "floor";
-  const canRingBell = auth?.role === "supervisor" || auth?.role === "floor";
+  /* canRingBell removed — ring bell feature stripped from simplified UI */
 
   useEffect(() => {
     const handleConnect = () => setBackendConnected(true);
@@ -390,58 +386,32 @@ export default function App() {
     );
   }
 
-  const isTalkToCustomer =
-    mixerState.mode === "talk-customer" || mixerState.mode === "talk-both";
-  const isTalkToSales =
-    mixerState.mode === "talk-sales" || mixerState.mode === "talk-both";
-
-  const speaking = {
-    customer:
-      Boolean(mixerState.participants.find((p) => p.id === "customer")?.micOn) &&
-      mixerState.connected,
-    sales:
-      Boolean(mixerState.participants.find((p) => p.id === "sales")?.micOn) &&
-      mixerState.connected,
-    supervisor:
-      Boolean(mixerState.participants.find((p) => p.id === "supervisor")?.micOn) &&
-      mixerState.connected &&
-      mixerState.mode !== "listen",
-  };
-
-  const routes = {
-    customerSalesActive:
-      mixerState.connected && speaking.customer && speaking.sales,
-    customerToSupervisor: mixerState.connected && speaking.customer,
-    salesToSupervisor: mixerState.connected && speaking.sales,
-    supervisorToCustomer:
-      mixerState.connected && isTalkToCustomer && speaking.supervisor,
-    supervisorToSales: mixerState.connected && isTalkToSales && speaking.supervisor,
-  };
-
-  const simulateLevels = () => {
-    const t = Date.now() / 420;
-    return {
-      l: mixerState.connected
-        ? Math.min(100, Math.max(8, mixerState.channelL + Math.sin(t) * 14))
-        : 0,
-      r: mixerState.connected
-        ? Math.min(100, Math.max(8, mixerState.channelR + Math.cos(t * 1.07) * 14))
-        : 0,
-    };
-  };
-
   const onToggleMic = (id) => {
     if (!isSupervisor && !isFloor && id !== auth.role) return;
     if (isFloor && id !== "customer" && id !== "sales") return;
     socket.emit("control:toggleMic", { id });
   };
 
-  return (
-    <div className="flex h-full min-h-[720px] flex-col bg-surface p-3 md:p-4">
-      <Header connected={mixerState.connected && backendConnected} />
+  const participants = mixerState.participants;
 
+  return (
+    <div className="flex h-full flex-col bg-surface p-4">
+      {/* ── Header ── */}
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-bold text-white">CommMixer</h1>
+        <span className={`flex items-center gap-1.5 text-xs font-medium ${
+          backendConnected ? "text-green-400" : "text-red-400"
+        }`}>
+          <span className={`inline-block h-2 w-2 rounded-full ${
+            backendConnected ? "bg-green-400" : "bg-red-400"
+          }`} />
+          {backendConnected ? "Connected" : "Disconnected"}
+        </span>
+      </div>
+
+      {/* ── Floor station panel ── */}
       {isFloor && (
-        <div className="mt-3 shrink-0">
+        <div className="mt-4">
           <FloorStationPanel
             socket={socket}
             presence={presence}
@@ -451,101 +421,81 @@ export default function App() {
         </div>
       )}
 
-      <main className="mt-3 grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[260px_minmax(0,1.35fr)_280px] lg:gap-4 lg:items-stretch">
-        <ParticipantsSidebar
-          participants={mixerState.participants}
-          speaking={speaking}
-          onToggleMic={onToggleMic}
-          focusOn={mixerState.focusOn}
-          currentRole={auth.role}
-          canToggleAll={isSupervisor || isFloor}
-        />
-        <AudioRoutingGraph routes={routes} mode={mixerState.mode} />
-        <SupervisorControls
-          mode={mixerState.mode}
-          onModeChange={(mode) => {
-            if (!isSupervisor) return;
-            socket.emit("control:setMode", { mode });
-          }}
-          volume={mixerState.volume}
-          onVolumeChange={(volume) => {
-            if (!isSupervisor) return;
-            socket.emit("control:setVolume", { volume });
-          }}
-          channelL={mixerState.channelL}
-          channelR={mixerState.channelR}
-          onChannelLChange={(channelL) =>
-            isSupervisor && socket.emit("control:setChannelL", { channelL })
-          }
-          onChannelRChange={(channelR) =>
-            isSupervisor && socket.emit("control:setChannelR", { channelR })
-          }
-          liveLevels={simulateLevels}
-          connected={mixerState.connected && backendConnected}
-          canManage={isSupervisor}
-          floorHint={isFloor}
-        />
-      </main>
-
-      {autoplayBlocked && isSupervisor && (
-        <div
-          className="mt-2 cursor-pointer rounded-lg bg-yellow-600/90 px-4 py-2 text-center text-sm font-medium text-white"
-          onClick={() => {
-            [audioFloorCustomerRef, audioFloorSalesRef].forEach((ref) => {
-              ref.current?.play()
-                .then(() => setAutoplayBlocked(false))
-                .catch(() => {});
-            });
-          }}
-        >
-          Browser blocked audio playback — click here to enable audio
-        </div>
-      )}
-
-      {isSupervisor && floorConnectionState && (
-        <p className={`mt-1 text-center text-xs font-medium ${
-          floorConnectionState === "connected" ? "text-green-400" :
-          floorConnectionState === "failed" || floorConnectionState === "disconnected" ? "text-red-400" :
-          "text-yellow-400"
-        }`}>
-          Floor connection: {floorConnectionState}
-        </p>
-      )}
-
-      {mediaError && (
-        <p className="mt-2 text-center text-sm text-red-400">{mediaError}</p>
-      )}
-
-      <BottomBar
-        ringing={mixerState.ringing}
-        onRingToggle={() =>
-          canRingBell &&
-          socket.emit("control:setRinging", { ringing: !mixerState.ringing })
-        }
-        focusOn={mixerState.focusOn}
-        onFocusToggle={() =>
-          isSupervisor &&
-          socket.emit("control:setFocus", { focusOn: !mixerState.focusOn })
-        }
-        recordOn={mixerState.recordOn}
-        onRecordToggle={() =>
-          isSupervisor &&
-          socket.emit("control:setRecord", { recordOn: !mixerState.recordOn })
-        }
-        connected={mixerState.connected && backendConnected}
-        onConnectedToggle={() =>
-          isSupervisor &&
-          socket.emit("control:setConnected", { connected: !mixerState.connected })
-        }
-        canRing={canRingBell}
-        canManage={isSupervisor}
-      />
-
+      {/* ── Supervisor panel ── */}
       {isSupervisor && (
-        <>
+        <div className="mt-4 space-y-4">
+          {/* Mode buttons */}
+          <div className="glass rounded-2xl p-5">
+            <h2 className="mb-1 text-base font-semibold text-white">Talk Mode</h2>
+            <p className="mb-4 text-xs text-zinc-500">
+              Default is Listen Only. Select a mode to talk back.
+            </p>
+            <SupervisorControls
+              mode={mixerState.mode}
+              onModeChange={(mode) => socket.emit("control:setMode", { mode })}
+              canManage={true}
+            />
+          </div>
+
+          {/* Mic controls */}
+          <div className="glass rounded-2xl p-5">
+            <h2 className="mb-3 text-base font-semibold text-white">Participants</h2>
+            <div className="space-y-2">
+              {participants.map((p) => (
+                <div key={p.id} className="flex items-center justify-between rounded-xl border border-white/5 bg-white/[0.03] px-4 py-3">
+                  <div>
+                    <span className="text-sm font-medium text-white">{p.name}</span>
+                    <span className="ml-2 text-xs text-zinc-500">{p.role}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onToggleMic(p.id)}
+                    className={`rounded-lg px-3 py-1.5 text-xs font-medium ${
+                      p.micOn
+                        ? "bg-green-500/20 text-green-400"
+                        : "bg-red-500/20 text-red-400"
+                    }`}
+                  >
+                    {p.micOn ? "Mic On" : "Mic Off"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Floor connection status */}
+          {floorConnectionState && (
+            <p className={`text-center text-xs font-medium ${
+              floorConnectionState === "connected" ? "text-green-400" :
+              floorConnectionState === "failed" || floorConnectionState === "disconnected" ? "text-red-400" :
+              "text-yellow-400"
+            }`}>
+              Floor connection: {floorConnectionState}
+            </p>
+          )}
+
+          {autoplayBlocked && (
+            <div
+              className="cursor-pointer rounded-lg bg-yellow-600/90 px-4 py-2 text-center text-sm font-medium text-white"
+              onClick={() => {
+                [audioFloorCustomerRef, audioFloorSalesRef].forEach((ref) => {
+                  ref.current?.play()
+                    .then(() => setAutoplayBlocked(false))
+                    .catch(() => {});
+                });
+              }}
+            >
+              Click here to enable audio playback
+            </div>
+          )}
+
+          {mediaError && (
+            <p className="text-center text-sm text-red-400">{mediaError}</p>
+          )}
+
           <audio ref={audioFloorCustomerRef} className="hidden" playsInline autoPlay />
           <audio ref={audioFloorSalesRef} className="hidden" playsInline autoPlay />
-        </>
+        </div>
       )}
     </div>
   );
